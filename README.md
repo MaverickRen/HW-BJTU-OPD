@@ -29,7 +29,7 @@ hf_card/                 public Hugging Face release card
 Large datasets, checkpoints, benchmark payloads, predictions, caches and credentials are deliberately excluded from Git. The companion public artifact repository is:
 
 ```text
-HW_BJTU_OPD/HW-BJTU-OPD
+HWBJTUOPD/HW-BJTU-OPD
 ```
 
 It contains the portable SFT_V1 10K snapshot and the merged 9B/27B SFT checkpoints in subdirectories.
@@ -80,7 +80,7 @@ The patch is part of the training implementation, not an optional performance tw
 ## 2. Download released artifacts
 
 ```bash
-hf download HW_BJTU_OPD/HW-BJTU-OPD --local-dir artifacts/hw-bjtu-opd
+hf download HWBJTUOPD/HW-BJTU-OPD --local-dir artifacts/hw-bjtu-opd
 ```
 
 Important paths after download:

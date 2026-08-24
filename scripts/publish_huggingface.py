@@ -13,7 +13,7 @@ from huggingface_hub import HfApi
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path)
-    parser.add_argument("--repo-id", default="HW_BJTU_OPD/HW-BJTU-OPD")
+    parser.add_argument("--repo-id", default="HWBJTUOPD/HW-BJTU-OPD")
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
 

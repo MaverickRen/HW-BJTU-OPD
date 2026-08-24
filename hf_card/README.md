@@ -31,7 +31,7 @@ Both checkpoints are merged Hugging Face models produced by one epoch of LoRA SF
 ## Download
 
 ```bash
-hf download HW_BJTU_OPD/HW-BJTU-OPD --local-dir hw-bjtu-opd
+hf download HWBJTUOPD/HW-BJTU-OPD --local-dir hw-bjtu-opd
 ```
 
 Load one variant by pointing Transformers or vLLM at its subdirectory:
