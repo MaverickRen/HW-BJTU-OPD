@@ -1,0 +1,23 @@
+{
+  "schema_version": "hw_bjtu_opd_sft_v1",
+  "name": "qwen35_9b_sft_v1_10k",
+  "base_model": "Qwen/Qwen3.5-9B",
+  "dataset_rows": 10000,
+  "dataset_sha256": "9f56d58c076c255df3bc660ba3c193b1cff8dd69c51ad2f73c844f5f2a8c49b0",
+  "epochs": 1,
+  "global_batch_size": 80,
+  "micro_batch_size_per_gpu": 1,
+  "optimizer_steps": 125,
+  "learning_rate": 0.00002,
+  "max_length": 16384,
+  "world_size": 8,
+  "seed": 42,
+  "dtype": "bfloat16",
+  "lora_rank": 16,
+  "lora_alpha": 16,
+  "lora_target_modules": "all-linear",
+  "dynamic_batch": true,
+  "length_bucket": true,
+  "length_bucket_image_token_proxy": 1024,
+  "shuffle": false
+}

@@ -1,0 +1,40 @@
+.venv/
+__pycache__/
+*.egg-info/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Runtime outputs and caches
+outputs/
+checkpoints/
+rollouts/
+tensorboard_log/
+ray_results/
+.cache/
+hf_stage/
+
+# Large artifacts never belong in the code repository
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.parquet
+*.arrow
+*.tar
+*.zip
+
+# Credentials and local overrides
+.env
+.env.*
+!.env.example
+*token*
+*credential*
+
+# Optional dependency checkouts created by scripts/bootstrap.sh
+third_party/*
+!third_party/.gitkeep

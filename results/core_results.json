@@ -1,0 +1,139 @@
+{
+  "schema_version": "hw_bjtu_opd_core_results_v1",
+  "frozen_at": "2026-08-24",
+  "benchmark_totals": {
+    "VStar": 191,
+    "MMStar": 1500,
+    "BLINK": 1901,
+    "ZoomBench": 845
+  },
+  "protocols": {
+    "VStar": {
+      "name": "vstar_frozen_first_option_v1",
+      "sha256": "55fe9e9013c5a38e20e29446f07106ef9ab482be0f79332676aef9a4bfa07d98"
+    },
+    "MMStar": {
+      "name": "mmstar_qwen35_modelcard_thinking_v2",
+      "sha256": "3d1baa4687ad3b5607cd622d0fef4e88f60f0f5c14bbe54d7b0ce0d1de221c17"
+    },
+    "BLINK-v5": {
+      "name": "blink_deterministic_checkpoint_comparison_v5",
+      "sha256": "ab5754c61c01c3c761c9fd72ae37480163884e894ffdb38cb805fe96b54204dc",
+      "leaderboard_claim": false
+    },
+    "BLINK-exact": {
+      "name": "blink_vlmevalkit_exact_matching_official_comparable_v8_blink_nonthinking",
+      "sha256": "a8dad8aeb7cc9c74a90e0ac5f2efb2d67cf5df2547870debf9bf0a33b1e36a9b"
+    },
+    "ZoomBench": {
+      "name": "zoombench_score_aggregate_v1",
+      "sha256": "de79d40ac9916300db8a139a851727bf6bcb4fb016e9c659bf77609f9cb19f5a"
+    }
+  },
+  "primary_blink_v5_matrix": [
+    {
+      "id": "qwen35-9b-raw",
+      "name": "Qwen3.5-9B",
+      "benchmarks": {
+        "VStar": {"correct": 162, "total": 191, "percent": 84.81675392670157},
+        "MMStar": {"correct": 1184, "total": 1500, "percent": 78.93333333333334},
+        "BLINK-v5": {"correct": 1124, "total": 1901, "percent": 59.12677538137822},
+        "ZoomBench": {"correct": 431, "total": 845, "percent": 51.005917159763314}
+      },
+      "macro_percent": 68.4706949502941
+    },
+    {
+      "id": "qwen35-27b-raw",
+      "name": "Qwen3.5-27B",
+      "benchmarks": {
+        "VStar": {"correct": 165, "total": 191, "percent": 86.38743455497382},
+        "MMStar": {"correct": 1190, "total": 1500, "percent": 79.33333333333333},
+        "BLINK-v5": {"correct": 969, "total": 1901, "percent": 50.97317201472909},
+        "ZoomBench": {"correct": 487, "total": 845, "percent": 57.633136094674555}
+      },
+      "macro_percent": 68.5817689994277
+    },
+    {
+      "id": "qwen35-9b-sft-v1-10k",
+      "name": "Qwen3.5-9B SFT_V1 10K",
+      "benchmarks": {
+        "VStar": {"correct": 164, "total": 191, "percent": 85.86387434554975},
+        "MMStar": {"correct": 1162, "total": 1500, "percent": 77.46666666666667},
+        "BLINK-v5": {"correct": 1235, "total": 1901, "percent": 64.96580746975276},
+        "ZoomBench": {"correct": 447, "total": 845, "percent": 52.899408284023664}
+      },
+      "macro_percent": 70.2989391914982
+    },
+    {
+      "id": "qwen35-27b-sft-v1-10k",
+      "name": "Qwen3.5-27B SFT_V1 10K",
+      "benchmarks": {
+        "VStar": {"correct": 165, "total": 191, "percent": 86.38743455497382},
+        "MMStar": {"correct": 1198, "total": 1500, "percent": 79.86666666666666},
+        "BLINK-v5": {"correct": 1191, "total": 1901, "percent": 62.65123619147816},
+        "ZoomBench": {"correct": 496, "total": 845, "percent": 58.698224852071}
+      },
+      "macro_percent": 71.90089056629742
+    },
+    {
+      "id": "sft9-vision6k-crop-raw9-teacher",
+      "name": "9B SFT_V1 Student + Vision-OPD-6K Crop + Raw9 Teacher",
+      "benchmarks": {
+        "VStar": {"correct": 177, "total": 191, "percent": 92.67015706806284},
+        "MMStar": {"correct": 1143, "total": 1500, "percent": 76.2},
+        "BLINK-v5": {"correct": 1220, "total": 1901, "percent": 64.17674907943189},
+        "ZoomBench": {"correct": 516, "total": 845, "percent": 61.065088757396445}
+      },
+      "macro_percent": 73.52799872622279
+    },
+    {
+      "id": "sft9-vision6k-crop-sft9-teacher",
+      "name": "9B SFT_V1 Student + Vision-OPD-6K Crop + 9B SFT_V1 Teacher",
+      "benchmarks": {
+        "VStar": {"correct": 176, "total": 191, "percent": 92.14659685863874},
+        "MMStar": {"correct": 1159, "total": 1500, "percent": 77.26666666666667},
+        "BLINK-v5": {"correct": 1263, "total": 1901, "percent": 66.43871646501842},
+        "ZoomBench": {"correct": 525, "total": 845, "percent": 62.1301775147929}
+      },
+      "macro_percent": 74.49553937627918
+    },
+    {
+      "id": "sft9-vision6k-crop-sft27-teacher",
+      "name": "9B SFT_V1 Student + Vision-OPD-6K Crop + 27B SFT_V1 Teacher",
+      "benchmarks": {
+        "VStar": {"correct": 179, "total": 191, "percent": 93.717277486911},
+        "MMStar": {"correct": 1143, "total": 1500, "percent": 76.2},
+        "BLINK-v5": {"correct": 1255, "total": 1901, "percent": 66.01788532351394},
+        "ZoomBench": {"correct": 537, "total": 845, "percent": 63.55029585798817}
+      },
+      "macro_percent": 74.87136466710328
+    }
+  ],
+  "vision_opd_reference_results": [
+    {
+      "id": "vision-opd-9b-official-6e41541",
+      "name": "Vision-OPD-9B official checkpoint",
+      "status": "partial_recovered",
+      "benchmarks": {
+        "VStar": {"correct": 175, "total": 191, "percent": 91.62303664921467},
+        "MMStar": null,
+        "BLINK": null,
+        "ZoomBench": null
+      },
+      "note": "Only the recovered VStar aggregate is authoritative; the other three formal cells were not completed."
+    },
+    {
+      "id": "vision-opd-9b-local-b1-step65",
+      "name": "Locally trained Vision-OPD-9B (B1 crop, step 65)",
+      "status": "complete_blink_exact",
+      "benchmarks": {
+        "VStar": {"correct": 170, "total": 191, "percent": 89.00523560209425},
+        "MMStar": {"correct": 1175, "total": 1500, "percent": 78.33333333333333},
+        "BLINK-exact": {"correct": 775, "total": 1901, "percent": 40.76801683324566},
+        "ZoomBench": {"correct": 509, "total": 845, "percent": 60.23668639053255}
+      },
+      "macro_percent": 67.08581803980144,
+      "note": "BLINK-exact is not numerically comparable with BLINK-v5."
+    }
+  ]
+}

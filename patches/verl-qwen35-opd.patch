@@ -1,0 +1,3600 @@
+diff --git a/tests/test_protocol_v2_on_cpu.py b/tests/test_protocol_v2_on_cpu.py
+index 63d0ee47..fc3bd6d6 100644
+--- a/tests/test_protocol_v2_on_cpu.py
++++ b/tests/test_protocol_v2_on_cpu.py
+@@ -149,6 +149,39 @@ def test_index_select_tensor_dict_preserves_3d_nested_tensor_layout_with_equal_s
+     tu.assert_tensordict_eq(selected, tu.get_tensordict({"position_ids": expected}))
+
+
++def test_maybe_fix_3d_position_ids_rebuilds_tq_single_sample_offsets_before_chunk():
++    seq_len = 17
++    input_ids = torch.nested.as_nested_tensor([torch.arange(seq_len)], layout=torch.jagged)
++    original_position_ids = torch.arange(4 * seq_len).reshape(4, seq_len)
++
++    # TransferQueue packs a one-sample list by inferring the first sample
++    # dimension (4), rather than seq_len, as jagged.
++    position_ids = torch.nested.as_nested_tensor([original_position_ids], layout=torch.jagged)
++    assert position_ids.offsets().tolist() == [0, 4]
++    data = tu.get_tensordict({"input_ids": input_ids, "position_ids": position_ids}).consolidate()
++    assert data.is_locked
++    assert data.is_consolidated()
++
++    tu.maybe_fix_3d_position_ids(data)
++
++    repaired = data["position_ids"]
++    assert data.is_locked
++    assert repaired._ragged_idx == 2
++    assert repaired.offsets().tolist() == [0, seq_len]
++    assert repaired.values().shape == (4, seq_len)
++    torch.testing.assert_close(repaired.values(), original_position_ids)
++
++    # Once offsets are aligned, the repair is idempotent even for a locked TD.
++    tu.maybe_fix_3d_position_ids(data)
++    assert data["position_ids"] is repaired
++
++    # This is the exact downstream operation that previously reduced [4, S]
++    # to [4, 4] on every data-parallel rank.
++    micro_batch = tu.chunk_tensordict(data, chunks=1)[0]
++    assert micro_batch["position_ids"].values().shape == (4, seq_len)
++    assert micro_batch["position_ids"].offsets().tolist() == [0, seq_len]
++
++
+ def test_tensordict_with_images():
+     # each sample contains a sequence with multiple images of different sizes
+     vocab_size = 128
+@@ -885,6 +918,28 @@ def test_chunk_tensordict_preserves_3d_nested_tensor_layout_with_equal_seq_len_p
+     assert torch.equal(chunks[1]["position_ids"].offsets(), expected_chunk_1.offsets())
+
+
++def test_chunk_tensordict_padded_fallback_slices_axis_major_position_ids(monkeypatch):
++    elements = [torch.arange(4 * seq_len).reshape(4, seq_len) for seq_len in (5, 8, 3, 7)]
++    position_ids = torch.nested.as_nested_tensor(elements, layout=torch.jagged)
++    td = tu.get_tensordict({"position_ids": position_ids})
++
++    original_unbind = torch.Tensor.unbind
++
++    def force_position_ids_padded_fallback(tensor, dim=0):
++        if tensor is position_ids:
++            raise RuntimeError("force padded fallback")
++        return original_unbind(tensor, dim=dim)
++
++    monkeypatch.setattr(torch.Tensor, "unbind", force_position_ids_padded_fallback)
++
++    chunks = tu.chunk_tensordict(td, chunks=2)
++
++    for chunk, expected in zip(chunks, (elements[:2], elements[2:]), strict=True):
++        assert chunk["position_ids"]._ragged_idx == 2
++        for actual, expected_sample in zip(chunk["position_ids"].unbind(0), expected, strict=True):
++            torch.testing.assert_close(actual, expected_sample)
++
++
+ def test_chunk_tensordict_preserves_3d_nested_tensor_layout_with_non_last_ragged_idx():
+     """Regression test: chunk_tensordict must handle nested tensors where the ragged dimension is not the last one."""
+     topk = 64
+diff --git a/tests/utils/test_padding_on_cpu.py b/tests/utils/test_padding_on_cpu.py
+index fc1a28f9..c0179c54 100644
+--- a/tests/utils/test_padding_on_cpu.py
++++ b/tests/utils/test_padding_on_cpu.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ import random
+
++import pytest
+ import torch
+ from tensordict import TensorDict
+
+@@ -21,11 +22,62 @@ from verl.workers.utils.padding import (
+     embeds_padding_2_no_padding,
+     left_right_2_no_padding,
+     no_padding_2_padding,
++    pack_position_ids,
+     response_from_nested,
+     response_to_nested,
+ )
+
+
++def test_pack_position_ids_uses_physical_layout_not_ragged_metadata():
++    seq_lens = [5, 3]
++    per_sample_axis_major = [
++        torch.arange(4 * seq_len, dtype=torch.long).reshape(4, seq_len) for seq_len in seq_lens
++    ]
++    expected = torch.cat(per_sample_axis_major, dim=1).unsqueeze(1)
++
++    axis_major = torch.nested.as_nested_tensor(per_sample_axis_major, layout=torch.jagged)
++    torch.testing.assert_close(pack_position_ids(axis_major, sum(seq_lens)), expected)
++
++    # Reproduce the physical token-major layout that can survive while the
++    # NestedTensor logical ragged metadata changes after serialization.
++    token_major = torch.nested.as_nested_tensor(
++        [sample.transpose(0, 1).contiguous() for sample in per_sample_axis_major], layout=torch.jagged
++    )
++    assert token_major.values().shape == (sum(seq_lens), 4)
++    torch.testing.assert_close(pack_position_ids(token_major, sum(seq_lens)), expected)
++
++
++def test_pack_position_ids_supports_three_mrope_axes():
++    pieces = [torch.arange(3 * 5).reshape(3, 5), torch.arange(3 * 2).reshape(3, 2)]
++    position_ids = torch.nested.as_nested_tensor(pieces, layout=torch.jagged)
++    expected = torch.cat(pieces, dim=1).unsqueeze(1)
++    torch.testing.assert_close(pack_position_ids(position_ids, total_tokens=7), expected)
++
++
++def test_pack_position_ids_supports_standard_1d_positions():
++    pieces = [torch.arange(5, dtype=torch.long), torch.arange(3, dtype=torch.long)]
++    position_ids = torch.nested.as_nested_tensor(pieces, layout=torch.jagged)
++    expected = torch.cat(pieces).unsqueeze(0)
++    torch.testing.assert_close(pack_position_ids(position_ids, total_tokens=8), expected)
++
++
++def test_pack_position_ids_rejects_token_count_mismatch():
++    position_ids = torch.nested.as_nested_tensor(
++        [torch.zeros((4, 5), dtype=torch.long), torch.zeros((4, 3), dtype=torch.long)], layout=torch.jagged
++    )
++    with pytest.raises(ValueError, match="do not match input token count"):
++        pack_position_ids(position_ids, total_tokens=7)
++
++
++@pytest.mark.parametrize("num_rope_axes", [2, 5])
++def test_pack_position_ids_rejects_unsupported_mrope_axis_count(num_rope_axes):
++    position_ids = torch.nested.as_nested_tensor(
++        [torch.zeros((num_rope_axes, 6), dtype=torch.long)], layout=torch.jagged
++    )
++    with pytest.raises(ValueError, match="Expected 3 or 4 M-RoPE position axes"):
++        pack_position_ids(position_ids, total_tokens=6)
++
++
+ def test_padding_conversion_with_log_probs():
+     """Test that log probability tensors remain in padded format after conversion
+
+diff --git a/tests/utils/test_tracking_on_cpu.py b/tests/utils/test_tracking_on_cpu.py
+index 85842871..9e3100ca 100644
+--- a/tests/utils/test_tracking_on_cpu.py
++++ b/tests/utils/test_tracking_on_cpu.py
+@@ -16,7 +16,9 @@ import sys
+ import types
+ from unittest.mock import MagicMock, patch
+
+-from verl.utils.tracking import ValidationGenerationsLogger
++import torch
++
++from verl.utils.tracking import ValidationGenerationsLogger, _TensorboardAdapter
+
+
+ def test_validation_generations_logger_logs_trackio_traces():
+@@ -46,3 +48,32 @@ def test_validation_generations_logger_logs_trackio_traces():
+     assert trace_kwargs["metadata"]["score"] == 0.5
+     mock_trackio.log.assert_called_once()
+     assert mock_trackio.log.call_args.kwargs["step"] == 7
++
++
++def test_tensorboard_adapter_routes_status_strings_to_text(tmp_path, monkeypatch):
++    writer = MagicMock()
++    monkeypatch.setenv("TENSORBOARD_DIR", str(tmp_path / "tensorboard"))
++
++    with patch("torch.utils.tensorboard.SummaryWriter", return_value=writer):
++        adapter = _TensorboardAdapter("project", "experiment")
++
++    adapter.log(
++        {
++            "actor/distillation_loss": 0.25,
++            "training/reward_available": False,
++            "training/reward_status": "unavailable",
++            "one_element_tensor": torch.tensor([0.5]),
++            "none_metadata": None,
++            "bytes_metadata": b"unavailable",
++            "list_metadata": [1, 2],
++            "dict_metadata": {"status": "unavailable"},
++            "multi_element_tensor": torch.tensor([1.0, 2.0]),
++        },
++        step=1,
++    )
++
++    assert writer.add_scalar.call_count == 3
++    writer.add_scalar.assert_any_call("actor/distillation_loss", 0.25, 1)
++    writer.add_scalar.assert_any_call("training/reward_available", False, 1)
++    writer.add_scalar.assert_any_call("one_element_tensor", torch.tensor([0.5]), 1)
++    writer.add_text.assert_called_once_with("training/reward_status", "unavailable", 1)
+diff --git a/tests/utils/test_vllm_weight_name_normalization_on_cpu.py b/tests/utils/test_vllm_weight_name_normalization_on_cpu.py
+index b11c0590..64d6afb6 100644
+--- a/tests/utils/test_vllm_weight_name_normalization_on_cpu.py
++++ b/tests/utils/test_vllm_weight_name_normalization_on_cpu.py
+@@ -182,6 +182,24 @@ def test_maybe_reload_standard_weights_falls_back_without_reload_api():
+     assert worker._maybe_reload_standard_weights_from_ipc(_UnusedReceiver()) is False
+
+
++def test_maybe_reload_standard_weights_falls_back_for_legacy_reload_api():
++    """vLLM 0.11/0.12 reload_weights() cannot consume an IPC weight iterator."""
++
++    class _UnusedReceiver:
++        def iter_weights(self):
++            raise AssertionError("fallback must not consume the streaming receiver")
++
++    worker = _make_worker(_FakeModel())
++    worker.model_runner.vllm_config = SimpleNamespace(speculative_config=None)
++
++    def _legacy_reload_weights():
++        raise AssertionError("legacy reload_weights must not be called")
++
++    worker.reload_weights = _legacy_reload_weights
++
++    assert worker._maybe_reload_standard_weights_from_ipc(_UnusedReceiver()) is False
++
++
+ def test_update_weights_normalizes_base_layer_names_before_fp8(monkeypatch):
+     import verl.workers.rollout.vllm_rollout.utils as worker_utils
+
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 1bd98610..a3eacd74 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -32,6 +32,8 @@ import logging
+ import os
+ import random
+ from abc import ABC, abstractmethod
++from copy import deepcopy
++from io import BytesIO
+ from typing import Any, Optional
+ from uuid import uuid4
+
+@@ -48,7 +50,7 @@ from transformers import AutoProcessor, AutoTokenizer
+ from verl.experimental.agent_loop.utils import resolve_config_path
+ from verl.protocol import DataProto
+ from verl.tools.tool_registry import load_all_tools
+-from verl.trainer.distillation import is_distillation_enabled
++from verl.trainer.distillation import is_distillation_enabled, is_distillation_only
+ from verl.utils.config import omega_conf_to_dataclass
+ from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
+ from verl.utils.model import compute_position_id_with_mask
+@@ -513,14 +515,22 @@ class AgentLoopWorker:
+         self.dataset_cls = get_dataset_class(config.data)
+         self.tokenizer = self.model_config.tokenizer
+         self.processor = self.model_config.processor
+-        self.mm_processor_kwargs = config.data.get("mm_processor_kwargs", {})
++        self.data_config = config.data
++        self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
++        self.mm_processor_kwargs = self.data_config.get("mm_processor_kwargs", {})
++        self.loop = get_event_loop()
+
+         # Online policy distillation
+         self.distillation_enabled = is_distillation_enabled(config.distillation)
++        self.distillation_only = is_distillation_only(config.distillation)
++        self.distillation_config = None
+         if self.distillation_enabled:
+             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
+
+-            self.teacher_key: str = config.distillation.teacher_key
++            from verl.workers.config import DistillationConfig
++
++            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(config.distillation)
++            self.teacher_key: str = self.distillation_config.teacher_key
+             self.teacher_server_manager = AsyncTeacherLLMServerManager(
+                 config=config,
+                 teacher_client=teacher_client,
+@@ -564,6 +574,33 @@ class AgentLoopWorker:
+                 mm_processor_kwargs["sampling_rate"] = int(sampling_rate)
+         return mm_processor_kwargs
+
++    async def _process_teacher_multi_modal_info(self, messages: list[dict]) -> dict[str, Any]:
++        """Use the same dataset-owned multimodal extraction as the student prompt."""
++        return await AgentLoopBase.process_multi_modal_info(self, messages)
++
++    async def _apply_teacher_chat_template(
++        self,
++        messages: list[dict],
++        *,
++        images: Optional[list[Image.Image]] = None,
++        videos: Optional[list[tuple[torch.Tensor, dict]]] = None,
++        audios: Optional[list[Any]] = None,
++        mm_processor_kwargs: Optional[dict[str, Any]] = None,
++    ) -> list[int]:
++        """Render privileged inputs through the exact student prompt-building implementation."""
++        return await AgentLoopBase.apply_chat_template(
++            self,
++            messages,
++            images=images,
++            videos=videos,
++            audios=audios,
++            mm_processor_kwargs=mm_processor_kwargs,
++        )
++
++    def _cap_text_prompt_length(self, prompt_ids: list[int]) -> list[int]:
++        """Delegate the shared text-only prompt cap used by the renderer."""
++        return AgentLoopBase._cap_text_prompt_length(self, prompt_ids)
++
+     async def generate_sequences(self, batch: DataProto) -> DataProto:
+         """Generate sequences from agent loop.
+
+@@ -817,7 +854,8 @@ class AgentLoopWorker:
+                 output.multi_modal_data.get("audios") if output.multi_modal_data else None
+             ),
+         )
+-        await self._compute_score([output], kwargs=kwargs)
++        if not self.distillation_only:
++            await self._compute_score([output], kwargs=kwargs)
+         await self._compute_teacher_logprobs(
+             output,
+             prompt_ids=output.prompt_ids,
+@@ -941,6 +979,12 @@ class AgentLoopWorker:
+
+     async def _compute_score(self, outputs: list[AgentLoopOutput], kwargs: dict) -> None:
+         """Compute reward score for all outputs in a trajectory; assigns result to outputs[-1]."""
++        # A supervised top-k distillation rollout has no task reward.  In
++        # particular, do not fall through to the default rule reward when the
++        # reward model is disabled: agent-loop datasets are not required to
++        # provide a reward function in this mode.
++        if is_distillation_only(getattr(self, "distillation_config", None)):
++            return
+         enable_async_reward = self.reward_loop_worker_handles is not None
+
+         final_output = outputs[-1]
+@@ -1003,6 +1047,229 @@ class AgentLoopWorker:
+                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+             final_output.metrics.compute_score = timing["compute_score"]
+
++    @staticmethod
++    def _teacher_image_values(value: Any) -> list[Any]:
++        """Normalize a non-tensor dataset column without accepting silent holes."""
++        if isinstance(value, np.ndarray):
++            value = value.tolist()
++        if value is None:
++            return []
++        if isinstance(value, (list, tuple)):
++            values = list(value)
++        else:
++            values = [value]
++        if any(item is None for item in values):
++            raise ValueError("Privileged teacher image lists must not contain null entries")
++        return values
++
++    @staticmethod
++    def _normalize_teacher_image(image: Any) -> Image.Image:
++        """Load one frozen teacher image as an owned RGB PIL object."""
++        if isinstance(image, Image.Image):
++            return image.convert("RGB")
++        if isinstance(image, (str, os.PathLike)):
++            with Image.open(os.fspath(image)) as value:
++                return value.convert("RGB")
++        if isinstance(image, dict):
++            if image.get("image") is not None:
++                return AgentLoopWorker._normalize_teacher_image(image["image"])
++            if image.get("bytes") is not None:
++                with Image.open(BytesIO(image["bytes"])) as value:
++                    return value.convert("RGB")
++            if image.get("path"):
++                return AgentLoopWorker._normalize_teacher_image(image["path"])
++        raise TypeError(f"Unsupported privileged teacher image type: {type(image)}")
++
++    @classmethod
++    def _replace_prompt_images(cls, raw_prompt: Any, teacher_images: list[Any]) -> list[dict[str, Any]]:
++        """Replace structured prompt image items without copying student pixels."""
++        if isinstance(raw_prompt, np.ndarray):
++            raw_prompt = raw_prompt.tolist()
++        if not isinstance(raw_prompt, (list, tuple)) or not raw_prompt:
++            raise ValueError("raw_prompt must be a non-empty message sequence for privileged distillation")
++
++        normalized = [cls._normalize_teacher_image(image) for image in teacher_images]
++        image_offset = 0
++        messages: list[dict[str, Any]] = []
++        for raw_message in raw_prompt:
++            if not isinstance(raw_message, dict):
++                raise TypeError(f"Teacher prompt message must be a dictionary, got {type(raw_message)}")
++            message = {key: deepcopy(value) for key, value in raw_message.items() if key != "content"}
++            content = raw_message.get("content")
++            if isinstance(content, list):
++                replacement_content = []
++                for item in content:
++                    if isinstance(item, dict) and item.get("type") == "image":
++                        if image_offset >= len(normalized):
++                            raise ValueError(
++                                "Teacher image count is smaller than the prompt's image placeholders"
++                            )
++                        replacement_content.append(
++                            {"type": "image", "image": normalized[image_offset]}
++                        )
++                        image_offset += 1
++                    else:
++                        replacement_content.append(deepcopy(item))
++                message["content"] = replacement_content
++            else:
++                message["content"] = deepcopy(content)
++            messages.append(message)
++        if image_offset != len(normalized):
++            raise ValueError(
++                "Teacher image count does not match the prompt's structured image placeholders: "
++                f"used={image_offset}, provided={len(normalized)}"
++            )
++        return messages
++
++    def _visual_special_token_mappings(self) -> dict[int, str]:
++        """Resolve visual control-token IDs which may not appear in generated responses."""
++        processing_class = self.processor or self.tokenizer
++        if processing_class is None:
++            return {}
++
++        mappings: dict[int, str] = {}
++        for attribute, fallback_token in (
++            ("image_token_id", "<|image_pad|>"),
++            ("video_token_id", "<|video_pad|>"),
++            ("vision_start_token_id", "<|vision_start|>"),
++            ("vision_end_token_id", "<|vision_end|>"),
++        ):
++            token_id = getattr(processing_class, attribute, None)
++            tokenizer = getattr(processing_class, "tokenizer", None)
++            if token_id is None and tokenizer is not None:
++                token_id = getattr(tokenizer, attribute, None)
++            if token_id is None:
++                tokenizer = tokenizer or processing_class
++                if hasattr(tokenizer, "convert_tokens_to_ids"):
++                    converted = tokenizer.convert_tokens_to_ids(fallback_token)
++                    if converted is not None and converted != getattr(tokenizer, "unk_token_id", None):
++                        token_id = converted
++            if token_id is not None:
++                mappings[int(token_id)] = fallback_token
++        return mappings
++
++    def _raise_if_response_contains_visual_special_tokens(
++        self,
++        output: AgentLoopOutput,
++        *,
++        sample_kwargs: Optional[dict[str, Any]],
++    ) -> None:
++        """Fail closed before visual response tokens can corrupt teacher image accounting."""
++        if len(output.response_ids) != len(output.response_mask):
++            raise ValueError(
++                "Response token and response-mask lengths differ before teacher inference: "
++                f"{len(output.response_ids)} != {len(output.response_mask)}"
++            )
++        visual_tokens = self._visual_special_token_mappings()
++        if not visual_tokens:
++            return
++        bad_tokens = [
++            {
++                "position": position,
++                "token_id": int(token_id),
++                "token": visual_tokens[int(token_id)],
++            }
++            for position, (token_id, active) in enumerate(zip(output.response_ids, output.response_mask, strict=True))
++            if bool(active) and int(token_id) in visual_tokens
++        ]
++        if bad_tokens:
++            sample_index = sample_kwargs.get("index") if sample_kwargs is not None else None
++            raise ValueError(
++                "Response contains visual special tokens before teacher inference, which would corrupt "
++                f"image-token accounting: index={sample_index!r}, bad_tokens={bad_tokens}"
++            )
++
++    async def _prepare_teacher_request(
++        self,
++        output: AgentLoopOutput,
++        *,
++        prompt_ids: list[int],
++        response_ids: list[int],
++        sample_kwargs: Optional[dict[str, Any]],
++    ) -> tuple[list[int], dict[str, Any], dict[str, Any], int, bool, dict[str, Any] | None]:
++        """Build a teacher request, rebuilding visual prompt IDs when configured."""
++        config = self.distillation_config
++        teacher_image_key = config.teacher_image_key if config is not None else None
++        default_multi_modal_data = output.multi_modal_data or {}
++        default_mm_processor_kwargs = output.mm_processor_kwargs or {}
++        default_sequence = prompt_ids + response_ids
++        if not teacher_image_key:
++            return (
++                default_sequence,
++                default_multi_modal_data,
++                default_mm_processor_kwargs,
++                len(prompt_ids),
++                False,
++                None,
++            )
++        if sample_kwargs is None:
++            raise ValueError(
++                f"Dataset sample fields are required for teacher_image_key={teacher_image_key!r}"
++            )
++
++        teacher_images = self._teacher_image_values(sample_kwargs.get(teacher_image_key))
++        if not teacher_images:
++            if not config.fallback_to_student_images:
++                raise ValueError(
++                    f"Teacher image key {teacher_image_key!r} is empty and student-image fallback is disabled"
++                )
++            evidence = {
++                "teacher_image_key": teacher_image_key,
++                "privileged_images_used": False,
++                "fallback_to_student_images_used": True,
++                "student_prompt_tokens": len(prompt_ids),
++                "teacher_prompt_tokens": len(prompt_ids),
++                "response_tokens": len(response_ids),
++                "teacher_image_count": len(default_multi_modal_data.get("images") or []),
++                "alignment": "identity_student_prompt",
++            }
++            return (
++                default_sequence,
++                default_multi_modal_data,
++                default_mm_processor_kwargs,
++                len(prompt_ids),
++                False,
++                evidence,
++            )
++
++        teacher_messages = self._replace_prompt_images(
++            sample_kwargs.get("raw_prompt"), teacher_images
++        )
++        teacher_multi_modal_data = await self._process_teacher_multi_modal_info(teacher_messages)
++        processed_teacher_images = teacher_multi_modal_data.get("images") or []
++        if len(processed_teacher_images) != len(teacher_images):
++            raise ValueError(
++                "Processed privileged teacher image count differs from the dataset column: "
++                f"{len(processed_teacher_images)} != {len(teacher_images)}"
++            )
++        teacher_audios = teacher_multi_modal_data.get("audios")
++        teacher_mm_processor_kwargs = self._get_mm_processor_kwargs(teacher_audios)
++        teacher_prompt_ids = await self._apply_teacher_chat_template(
++            teacher_messages,
++            images=processed_teacher_images,
++            videos=teacher_multi_modal_data.get("videos"),
++            audios=teacher_audios,
++            mm_processor_kwargs=teacher_mm_processor_kwargs,
++        )
++        evidence = {
++            "teacher_image_key": teacher_image_key,
++            "privileged_images_used": True,
++            "fallback_to_student_images_used": False,
++            "student_prompt_tokens": len(prompt_ids),
++            "teacher_prompt_tokens": len(teacher_prompt_ids),
++            "response_tokens": len(response_ids),
++            "teacher_image_count": len(processed_teacher_images),
++            "alignment": "response_logprob_positions",
++        }
++        return (
++            teacher_prompt_ids + response_ids,
++            teacher_multi_modal_data,
++            teacher_mm_processor_kwargs,
++            len(teacher_prompt_ids),
++            True,
++            evidence,
++        )
++
+     async def _compute_teacher_logprobs(
+         self,
+         output: AgentLoopOutput,
+@@ -1013,6 +1280,23 @@ class AgentLoopWorker:
+     ) -> None:
+         """Compute teacher logprobs for single sample."""
+         if self.distillation_enabled and not validate:
++            self._raise_if_response_contains_visual_special_tokens(
++                output,
++                sample_kwargs=sample_kwargs,
++            )
++            (
++                teacher_sequence_ids,
++                teacher_multi_modal_data,
++                teacher_mm_processor_kwargs,
++                teacher_prompt_length,
++                privileged_prompt,
++                teacher_input_evidence,
++            ) = await self._prepare_teacher_request(
++                output,
++                prompt_ids=prompt_ids,
++                response_ids=response_ids,
++                sample_kwargs=sample_kwargs,
++            )
+             routing_key = None
+             if sample_kwargs is not None:
+                 routing_value = sample_kwargs.get(self.teacher_key)
+@@ -1020,13 +1304,25 @@ class AgentLoopWorker:
+                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
+                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
+-                sequence_ids=prompt_ids + response_ids,
+-                multi_modal_data=output.multi_modal_data,
+-                mm_processor_kwargs=output.mm_processor_kwargs,
++                sequence_ids=teacher_sequence_ids,
++                multi_modal_data=teacher_multi_modal_data,
++                mm_processor_kwargs=teacher_mm_processor_kwargs,
+                 routing_key=routing_key,
+             )
++            if privileged_prompt:
++                from verl.experimental.teacher_loop.teacher_manager import align_teacher_response_outputs
++
++                teacher_ids, teacher_logprobs = align_teacher_response_outputs(
++                    teacher_ids,
++                    teacher_logprobs,
++                    teacher_prompt_length=teacher_prompt_length,
++                    student_prompt_length=len(prompt_ids),
++                    response_length=len(response_ids),
++                )
+             output.extra_fields["teacher_ids"] = teacher_ids
+             output.extra_fields["teacher_logprobs"] = teacher_logprobs
++            if teacher_input_evidence is not None:
++                output.extra_fields["teacher_input_evidence"] = teacher_input_evidence
+
+     def _postprocess(
+         self,
+diff --git a/verl/experimental/reward_loop/reward_loop.py b/verl/experimental/reward_loop/reward_loop.py
+index 1f39aaa4..cb187f28 100644
+--- a/verl/experimental/reward_loop/reward_loop.py
++++ b/verl/experimental/reward_loop/reward_loop.py
+@@ -26,6 +26,7 @@ from tensordict import TensorDict
+ from verl.protocol import DataProto, pad_dataproto_to_divisor
+ from verl.single_controller.ray.base import RayResourcePool
+ from verl.trainer.ppo.reward import load_reward_manager, resolve_reward_manager_cls
++from verl.trainer.distillation import is_distillation_only
+ from verl.utils import hf_tokenizer
+ from verl.utils.fs import copy_to_local
+ from verl.utils.ray_utils import get_event_loop
+@@ -278,15 +279,22 @@ class RewardLoopManager:
+
+     def __init__(self, config: DictConfig, rm_resource_pool: RayResourcePool = None):
+         self.config = config
+-        if self.config.reward.reward_model.enable:
++        self.distillation_only = is_distillation_only(config.get("distillation"))
++        if self.distillation_only:
++            # Pure distillation has no task reward.  Do not even initialize a
++            # colocated reward-model manager: that would reserve resources and
++            # violate the no-reward contract before worker creation is skipped.
++            self.reward_model_manager = None
++            self.reward_router_address = None
++        elif self.config.reward.reward_model.enable:
+             self.reward_model_manager = RewardModelManager(config.reward.reward_model, rm_resource_pool)
+             self.reward_router_address = self.reward_model_manager.get_router_address()
+         else:
+             self.reward_model_manager = None
+             self.reward_router_address = None
+
+-        self.reward_loop_workers_class = ray.remote(RewardLoopWorker)
+-        self.reward_manager_cls = resolve_reward_manager_cls(config)
++        self.reward_loop_workers_class = None if self.distillation_only else ray.remote(RewardLoopWorker)
++        self.reward_manager_cls = None if self.distillation_only else resolve_reward_manager_cls(config)
+         self._init_reward_loop_workers()
+
+     @property
+@@ -297,12 +305,19 @@ class RewardLoopManager:
+         (1) rule-based reward without reward model
+         (2) reward model with extra resource pool
+         """
++        if self.distillation_only:
++            return None
+         if not self.config.reward.reward_model.enable or self.config.reward.reward_model.enable_resource_pool:
+             return self.reward_loop_workers
+         return None
+
+     def _init_reward_loop_workers(self):
+         self.reward_loop_workers = []
++        # Pure top-k distillation does not have a task reward.  Avoid creating
++        # rule-reward workers at all: their default reward manager would try to
++        # resolve ``data_source`` as a reward function and fail every prompt.
++        if self.distillation_only:
++            return
+         num_workers = self.config.reward.num_workers
+         node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
+
+@@ -321,6 +336,8 @@ class RewardLoopManager:
+             )
+
+     def compute_rm_score(self, data: DataProto) -> DataProto:
++        if self.distillation_only:
++            raise RuntimeError("Pure distillation does not define task rewards")
+         if self.reward_model_manager is not None:
+             self.reward_model_manager.wake_up()
+
+diff --git a/verl/experimental/teacher_loop/teacher_manager.py b/verl/experimental/teacher_loop/teacher_manager.py
+index d9cb4c51..b070f95e 100644
+--- a/verl/experimental/teacher_loop/teacher_manager.py
++++ b/verl/experimental/teacher_loop/teacher_manager.py
+@@ -79,6 +79,76 @@ def _pad_teacher_outputs(
+     )
+
+
++def align_teacher_response_outputs(
++    teacher_ids: torch.Tensor,
++    teacher_logprobs: torch.Tensor,
++    *,
++    teacher_prompt_length: int,
++    student_prompt_length: int,
++    response_length: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Align a privileged teacher's response distributions to student positions.
++
++    ``extract_prompt_logprobs`` drops the undefined first-token distribution
++    and appends one dummy row at the end.  Consequently, for a teacher prompt
++    of length ``q`` and a response of length ``r``, the distributions which
++    predict the response live at ``[q - 1 : q + r - 1]``.  Student losses are
++    read from the analogous ``[p - 1 : p + r - 1]`` interval.  Privileged
++    images can change ``q`` by thousands of visual tokens, so an absolute copy
++    would silently compare the wrong positions.
++
++    Prompt and terminal rows are filled with dummies because the response mask
++    excludes them from the distillation loss.
++    """
++    for name, value in (
++        ("teacher_prompt_length", teacher_prompt_length),
++        ("student_prompt_length", student_prompt_length),
++        ("response_length", response_length),
++    ):
++        if not isinstance(value, int) or isinstance(value, bool):
++            raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
++    if teacher_prompt_length <= 0 or student_prompt_length <= 0:
++        raise ValueError("Teacher and student prompts must both contain at least one token")
++    if response_length < 0:
++        raise ValueError("response_length must be non-negative")
++    if teacher_ids.ndim != 2 or teacher_logprobs.ndim != 2:
++        raise ValueError(
++            "Teacher ids/logprobs must both have shape [sequence, distribution_width]"
++        )
++    if teacher_ids.shape != teacher_logprobs.shape:
++        raise ValueError(
++            f"Teacher ids/logprobs shape mismatch: {teacher_ids.shape} != {teacher_logprobs.shape}"
++        )
++    expected_teacher_length = teacher_prompt_length + response_length
++    if teacher_ids.shape[0] != expected_teacher_length:
++        raise ValueError(
++            "Teacher output length differs from rebuilt prompt plus response: "
++            f"{teacher_ids.shape[0]} != {teacher_prompt_length} + {response_length}"
++        )
++
++    student_sequence_length = student_prompt_length + response_length
++    aligned_ids = torch.zeros(
++        (student_sequence_length, teacher_ids.shape[1]),
++        dtype=teacher_ids.dtype,
++        device=teacher_ids.device,
++    )
++    aligned_logprobs = torch.zeros(
++        (student_sequence_length, teacher_logprobs.shape[1]),
++        dtype=teacher_logprobs.dtype,
++        device=teacher_logprobs.device,
++    )
++    if response_length:
++        teacher_start = teacher_prompt_length - 1
++        student_start = student_prompt_length - 1
++        aligned_ids[student_start : student_start + response_length] = teacher_ids[
++            teacher_start : teacher_start + response_length
++        ]
++        aligned_logprobs[student_start : student_start + response_length] = teacher_logprobs[
++            teacher_start : teacher_start + response_length
++        ]
++    return aligned_ids, aligned_logprobs
++
++
+ class AsyncTeacherLLMServerManager:
+     """Teacher-specific async client used for distillation logprob computation."""
+
+diff --git a/verl/experimental/teacher_loop/teacher_model.py b/verl/experimental/teacher_loop/teacher_model.py
+index c8e9b2cc..b61196d7 100644
+--- a/verl/experimental/teacher_loop/teacher_model.py
++++ b/verl/experimental/teacher_loop/teacher_model.py
+@@ -42,6 +42,7 @@ class TeacherModelManager:
+         distillation_config: DistillationConfig,
+         teacher_model_config: DistillationTeacherModelConfig,
+         resource_pool: RayResourcePool,
++        defer_server_launch: bool = False,
+     ):
+         """
+         Initialize the teacher model manager.
+@@ -56,8 +57,14 @@ class TeacherModelManager:
+         self.distillation_config = distillation_config
+         self.teacher_model_config = teacher_model_config
+         self.resource_pool = resource_pool
++        self.defer_server_launch = defer_server_launch
++        self._servers_started = False
++        self.server_handles: list = []
++        self.server_addresses: list[str] = []
++        self.load_balancer_handle = None
+         self._initialize_llm_servers()
+-        self._initialize_load_balancer_handle()
++        if not self.defer_server_launch:
++            self._initialize_load_balancer_handle()
+
+     def _initialize_llm_servers(self):
+         teacher_model_config = self.teacher_model_config
+@@ -91,14 +98,35 @@ class TeacherModelManager:
+         split_resource_pools = split_resource_pool(self.resource_pool, split_size=per_replica_world_size)
+         assert len(split_resource_pools) == len(self.rollout_replicas)
+         self._validate_replica_node_alignment(split_resource_pools, per_replica_world_size, gpus_per_node)
++        init_method = "prepare_colocated" if self.defer_server_launch else "init_colocated"
+         _run_all(
+             [
+-                server.init_colocated(resource_pool)
++                getattr(server, init_method)(resource_pool)
+                 for server, resource_pool in zip(self.rollout_replicas, split_resource_pools, strict=True)
+             ]
+         )
++        if not self.defer_server_launch:
++            self._record_server_handles()
++
++    def _record_server_handles(self) -> None:
+         self.server_handles = [server._server_handle for server in self.rollout_replicas]
+         self.server_addresses = [server._server_address for server in self.rollout_replicas]
++        self._servers_started = True
++
++    @property
++    def worker_handles(self) -> list:
++        """The prepared rollout workers, before or after server launch."""
++        return [worker for replica in self.rollout_replicas for worker in replica.workers]
++
++    def launch_servers(self) -> None:
++        """Start deferred teacher servers after any pre-model resource gate."""
++        if self._servers_started:
++            return
++        if not self.defer_server_launch:
++            raise RuntimeError("teacher servers were not deferred")
++        _run_all([server.launch_servers() for server in self.rollout_replicas])
++        self._record_server_handles()
++        self._initialize_load_balancer_handle()
+
+     def _validate_replica_node_alignment(self, replica_pools, per_replica_world_size, gpus_per_node):
+         """Verify that each replica occupies the expected number of nodes.
+@@ -158,6 +186,7 @@ class MultiTeacherModelManager:
+         self,
+         config: DictConfig,
+         resource_pool: RayResourcePool,
++        defer_server_launch: bool = False,
+     ):
+         """
+         Initialize the multi-teacher model manager.
+@@ -174,6 +203,7 @@ class MultiTeacherModelManager:
+         self.server_addresses: dict[str, list[str]] = {}
+         self.server_handles: dict[str, list] = {}
+         self.load_balancer_handle: dict[str, object] = {}
++        self.defer_server_launch = defer_server_launch
+
+         self._initialize_teacher_model_managers()
+
+@@ -187,16 +217,36 @@ class MultiTeacherModelManager:
+                 distillation_config=self.distillation_config,
+                 teacher_model_config=teacher_model_config,
+                 resource_pool=teacher_pool,
++                defer_server_launch=self.defer_server_launch,
+             )
+             self.teacher_model_managers[key] = manager
+-            self.server_addresses[key] = manager.server_addresses
+-            self.server_handles[key] = manager.server_handles
+-            self.load_balancer_handle[key] = manager.load_balancer_handle
++            if not self.defer_server_launch:
++                self._record_manager(key, manager)
++
++    def _record_manager(self, key: str, manager: TeacherModelManager) -> None:
++        self.server_addresses[key] = manager.server_addresses
++        self.server_handles[key] = manager.server_handles
++        self.load_balancer_handle[key] = manager.load_balancer_handle
++
++    @property
++    def worker_handles(self) -> list:
++        """All prepared teacher rollout worker handles."""
++        return [worker for manager in self.teacher_model_managers.values() for worker in manager.worker_handles]
++
++    def launch_servers(self) -> None:
++        """Launch all deferred teacher servers after the role GPU gate."""
++        if not self.defer_server_launch:
++            raise RuntimeError("teacher servers were not deferred")
++        for key, manager in self.teacher_model_managers.items():
++            manager.launch_servers()
++            self._record_manager(key, manager)
+
+     def get_client(self) -> dict[str, LLMServerClient]:
+         """Get the LLMServerClient for each teacher model."""
+         teacher_clients = {}
+         for key, manager in self.teacher_model_managers.items():
++            if manager.load_balancer_handle is None:
++                raise RuntimeError("teacher servers are not initialized")
+             teacher_clients[key] = LLMServerClient(
+                 config=self.config,
+                 load_balancer_handle=manager.load_balancer_handle,
+diff --git a/verl/model_merger/base_model_merger.py b/verl/model_merger/base_model_merger.py
+index 54a682fa..bb98cfca 100644
+--- a/verl/model_merger/base_model_merger.py
++++ b/verl/model_merger/base_model_merger.py
+@@ -403,7 +403,19 @@ class BaseModelMerger(ABC):
+         drop_tied_target_keys(state_dict, model, self.model_config)
+
+         print(f"Saving model to {self.config.target_dir}")
+-        model.save_pretrained(self.config.target_dir, state_dict=state_dict)
++        # The FSDP state dict already uses the current in-memory model names.
++        # Transformers 5.x defaults ``save_original_format=True`` and applies a
++        # legacy reverse key mapping on save.  For Qwen3.5 that mapping rewrites
++        # already-current keys a second time (for example
++        # ``model.language_model.*`` becomes a triple ``language_model``
++        # namespace), producing a safetensors file that neither Transformers nor
++        # vLLM can load.  Never apply the legacy reverse mapping to a freshly
++        # collected veRL state dict.
++        model.save_pretrained(
++            self.config.target_dir,
++            state_dict=state_dict,
++            save_original_format=False,
++        )
+         del state_dict
+         del model
+
+diff --git a/verl/single_controller/base/worker.py b/verl/single_controller/base/worker.py
+index afa3c4e4..c36f2975 100644
+--- a/verl/single_controller/base/worker.py
++++ b/verl/single_controller/base/worker.py
+@@ -19,6 +19,7 @@ import os
+ import socket
+ import warnings
+ from dataclasses import dataclass
++from typing import Any, Mapping, Sequence
+
+ import ray
+
+@@ -83,6 +84,38 @@ class Worker(WorkerHelper):
+
+     fused_worker_attr_name = "fused_worker_dict"
+
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    def get_role_gpu_observation(self) -> dict[str, Any]:
++        """Return the Ray-assigned GPU identity before model initialization.
++
++        This deliberately reports Ray's assignment and the process visibility
++        environment without changing either one.  The trainer uses the method
++        as a pre-model admission probe when the explicit role-partition gate is
++        enabled.
++        """
++        resource_name = get_resource_name()
++        accelerator_ids = ray.get_runtime_context().get_accelerator_ids().get(resource_name, [])
++        visible_devices = os.environ.get(get_visible_devices_keyword(), "")
++        gpu_uuid = None
++        if resource_name == "GPU":
++            try:
++                # Ray gives each worker one GPU.  CUDA device 0 therefore
++                # resolves to the physical device represented by the Ray ID.
++                properties = get_torch_device().get_device_properties(0)
++                gpu_uuid = getattr(properties, "uuid", None)
++                if gpu_uuid is not None:
++                    gpu_uuid = str(gpu_uuid)
++            except (AttributeError, RuntimeError, ValueError):
++                gpu_uuid = None
++        return {
++            "pid": os.getpid(),
++            "rank": self.rank,
++            "node_id": ray.get_runtime_context().get_node_id(),
++            "ray_accelerator_ids": [str(value) for value in accelerator_ids],
++            "cuda_visible_devices": visible_devices,
++            "gpu_uuid": gpu_uuid,
++        }
++
+     def _register_dispatch_collect_info(self, mesh_name: str, dp_rank: int, is_collect: bool):
+         """Register the dp_rank for a given mesh name. This function is meant to be called by the worker
+
+@@ -346,3 +379,123 @@ class Worker(WorkerHelper):
+         """
+         result = func(*args, **kwargs)
+         return result
++
++
++def validate_role_gpu_partition(
++    observations: Sequence[Mapping[str, Any]],
++    *,
++    student_physical_gpus: Sequence[int],
++    teacher_physical_gpus: Sequence[int],
++    require_gpu_uuid: bool = False,
++) -> dict[str, Any]:
++    """Validate a strict student/teacher physical-GPU partition.
++
++    This function is deliberately independent of Ray and CUDA so that the
++    admission contract can be tested on CPU.  The worker-side probe supplies
++    the observations; this function only validates and normalizes them.
++    """
++
++    def _expected(values: Sequence[int], label: str) -> tuple[int, ...]:
++        if not isinstance(values, (list, tuple)) or not values:
++            raise ValueError(f"{label} physical GPU partition must be a non-empty list")
++        if any(type(value) is not int or value < 0 for value in values):
++            raise ValueError(f"{label} physical GPU partition must contain non-negative integers")
++        if len(set(values)) != len(values):
++            raise ValueError(f"{label} physical GPU partition contains duplicates")
++        return tuple(values)
++
++    expected = {
++        "student": _expected(student_physical_gpus, "student"),
++        "teacher": _expected(teacher_physical_gpus, "teacher"),
++    }
++    if set(expected["student"]) & set(expected["teacher"]):
++        raise ValueError("student and teacher physical GPU partitions overlap")
++
++    normalized: list[dict[str, Any]] = []
++    seen_physical: set[int] = set()
++    seen_uuids: set[str] = set()
++    for observation in observations:
++        if not isinstance(observation, Mapping):
++            raise ValueError("GPU observation must be a mapping")
++        role = observation.get("role")
++        if role not in expected:
++            raise ValueError(f"unknown GPU observation role: {role!r}")
++        rank = observation.get("rank")
++        if type(rank) is not int or rank < 0:
++            raise ValueError("GPU observation rank must be a non-negative integer")
++        pid = observation.get("pid")
++        if type(pid) is not int or pid <= 0:
++            raise ValueError("GPU observation pid must be a positive integer")
++        node_id = observation.get("node_id")
++        if not isinstance(node_id, str) or not node_id:
++            raise ValueError("GPU observation node_id must be a non-empty string")
++
++        ray_ids = observation.get("ray_accelerator_ids")
++        if not isinstance(ray_ids, (list, tuple)) or len(ray_ids) != 1 or not isinstance(ray_ids[0], str):
++            raise ValueError("GPU observation must have one Ray accelerator ID")
++        ray_id = ray_ids[0]
++        if not ray_id.isdigit():
++            raise ValueError("Ray accelerator ID must be a numeric physical index")
++        if str(int(ray_id)) != ray_id:
++            raise ValueError("Ray accelerator ID must use canonical decimal notation")
++        physical_gpu = int(ray_id)
++
++        visible_devices = observation.get("cuda_visible_devices")
++        if not isinstance(visible_devices, str):
++            raise ValueError("CUDA visible devices must be a string")
++        if visible_devices != ray_id:
++            raise ValueError("Ray ID and CUDA visibility must identify the same one GPU")
++
++        if physical_gpu in seen_physical:
++            raise ValueError("physical GPU assignments are not unique")
++        seen_physical.add(physical_gpu)
++
++        gpu_uuid = observation.get("gpu_uuid")
++        if require_gpu_uuid and (not isinstance(gpu_uuid, str) or not gpu_uuid):
++            raise ValueError("GPU UUID is required")
++        if gpu_uuid is not None:
++            if not isinstance(gpu_uuid, str) or not gpu_uuid:
++                raise ValueError("GPU UUID must be a non-empty string")
++            if gpu_uuid in seen_uuids:
++                raise ValueError("GPU UUIDs are not unique")
++            seen_uuids.add(gpu_uuid)
++
++        normalized.append(
++            {
++                "role": role,
++                "rank": rank,
++                "pid": pid,
++                "node_id": node_id,
++                "ray_accelerator_ids": [ray_id],
++                "cuda_visible_devices": ray_id,
++                "physical_gpu": physical_gpu,
++                "gpu_uuid": gpu_uuid,
++            }
++        )
++
++    required_count = len(expected["student"]) + len(expected["teacher"])
++    if len(normalized) != required_count:
++        raise ValueError(f"expected {required_count} GPU observations, got {len(normalized)}")
++    nodes = {record["node_id"] for record in normalized}
++    if len(nodes) != 1:
++        raise ValueError("student and teacher GPU workers must be on one node")
++
++    for role, physical_gpus in expected.items():
++        role_records = [record for record in normalized if record["role"] == role]
++        if {record["physical_gpu"] for record in role_records} != set(physical_gpus):
++            raise ValueError(f"{role} physical GPU partition does not match expected GPUs")
++        if sorted(record["rank"] for record in role_records) != list(range(len(physical_gpus))):
++            raise ValueError(f"{role} GPU ranks are not contiguous and unique")
++        physical_gpu_by_rank = {
++            record["rank"]: record["physical_gpu"] for record in role_records
++        }
++        if physical_gpu_by_rank != dict(enumerate(physical_gpus)):
++            raise ValueError(f"{role} rank-to-physical-GPU mapping does not match expected GPUs")
++
++    role_order = {"student": 0, "teacher": 1}
++    normalized.sort(key=lambda record: (role_order[record["role"]], record["rank"]))
++    return {
++        "node_id": next(iter(nodes)),
++        "expected": {"student": list(expected["student"]), "teacher": list(expected["teacher"])},
++        "observations": normalized,
++    }
+diff --git a/verl/trainer/config/distillation/distillation.yaml b/verl/trainer/config/distillation/distillation.yaml
+index 84ee7932..fd6e7555 100644
+--- a/verl/trainer/config/distillation/distillation.yaml
++++ b/verl/trainer/config/distillation/distillation.yaml
+@@ -110,4 +110,13 @@ teacher_models:
+       temperature: ${oc.select:actor_rollout_ref.rollout.temperature}
+
+ # Key to route examples to the appropriate teacher model in multi-teacher setups. Should correspond to a field in the data proto, e.g., task.
+-teacher_key: data_source
+\ No newline at end of file
++teacher_key: data_source
++
++# Optional dataset column holding privileged teacher-side images.  The agent
++# loop must rebuild the teacher prompt because a replacement image can produce
++# a different visual-token grid from the student's image.
++teacher_image_key: null
++
++# If true, rows whose teacher_image_key value is empty use the student's
++# original multimodal prompt.  If false, a missing privileged image is fatal.
++fallback_to_student_images: false
+diff --git a/verl/trainer/distillation/losses.py b/verl/trainer/distillation/losses.py
+index 3467e59e..b2421d46 100644
+--- a/verl/trainer/distillation/losses.py
++++ b/verl/trainer/distillation/losses.py
+@@ -40,7 +40,38 @@ def is_distillation_enabled(config: Optional[DistillationConfig]) -> bool:
+     """Check if distillation is enabled based on the provided configuration."""
+     if config is None:
+         return False
+-    return config.enabled
++    if isinstance(config, dict):
++        return bool(config.get("enabled", False))
++    return bool(config.enabled)
++
++
++def is_distillation_only(config: Optional[DistillationConfig]) -> bool:
++    """Return whether a rollout is a pure supervised top-k distillation step.
++
++    Pure distillation has no task reward or policy-gradient objective.  Such a
++    step only needs the rollout response, teacher top-k values, and actor
++    update; reward/advantage/reference/critic stages must not be entered.  The
++    helper deliberately accepts both the dataclass and Hydra ``DictConfig``
++    forms because the two forms are used at different process boundaries.
++    """
++    if not is_distillation_enabled(config):
++        return False
++
++    def _get(value: Any, key: str, default: Any = None) -> Any:
++        if isinstance(value, dict):
++            return value.get(key, default)
++        return getattr(value, key, default)
++
++    distillation_loss = _get(config, "distillation_loss")
++    if distillation_loss is None:
++        return False
++
++    loss_mode = _get(distillation_loss, "loss_mode")
++    loss_settings = _get(distillation_loss, "loss_settings")
++    use_topk = _get(loss_settings, "use_topk", loss_mode == "forward_kl_topk")
++    use_task_rewards = _get(distillation_loss, "use_task_rewards", True)
++    use_policy_gradient = _get(distillation_loss, "use_policy_gradient", True)
++    return bool(use_topk and not use_task_rewards and not use_policy_gradient)
+
+
+ @dataclass
+@@ -135,8 +166,8 @@ def compute_topk_loss(
+     - teacher_mass: (bsz, seqlen/cp_size)
+     """
+     match config.strategy:
+-        # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
+-        case "fsdp" | "veomni":
++        # FSDP2 and VeOmni use the same top-k loss computation as FSDP1.
++        case "fsdp" | "fsdp2" | "veomni":
+             import verl.trainer.distillation.fsdp.losses as fsdp_losses
+
+             distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+@@ -205,6 +236,15 @@ def distillation_ppo_loss(
+         return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
+
+     # Called as final policy loss
++    # Normalize every micro-batch against the same global mini-batch, as ppo_loss
++    # does below. This must happen before distillation_loss: the direct supervised
++    # path can skip ppo_loss entirely, and the policy-gradient path consumes this
++    # information while constructing its own loss.
++    config.global_batch_info["dp_size"] = data["dp_size"]
++    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
++    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
++    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
++
+     distillation_loss_config = distillation_config.distillation_loss
+     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
+     if not distillation_loss_config.use_task_rewards and not distillation_loss_config.use_policy_gradient:
+diff --git a/verl/trainer/main_ppo.py b/verl/trainer/main_ppo.py
+index 384f48aa..37b948c9 100644
+--- a/verl/trainer/main_ppo.py
++++ b/verl/trainer/main_ppo.py
+@@ -52,6 +52,7 @@ def run_ppo(config, task_runner_class) -> None:
+     if "rl_insight" in ([trainer_logger] if isinstance(trainer_logger, str) else trainer_logger or []):
+         os.environ["VERL_RL_INSIGHT_ENABLE"] = "1"
+
++    started_local_ray = False
+     # Check if Ray is not initialized
+     if not ray.is_initialized():
+         # Initialize Ray with a local cluster configuration
+@@ -72,31 +73,36 @@ def run_ppo(config, task_runner_class) -> None:
+         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+         print(f"ray init kwargs: {ray_init_kwargs}")
+         ray.init(**OmegaConf.to_container(ray_init_kwargs))
+-
+-    # Create a remote instance of the TaskRunner class, and
+-    # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
+-    if (
+-        is_cuda_available
+-        and config.global_profiler.tool == "nsys"
+-        and config.global_profiler.get("steps") is not None
+-        and len(config.global_profiler.get("steps", [])) > 0
+-    ):
+-        from verl.utils.import_utils import is_nvtx_available
+-
+-        assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
+-        nsight_options = OmegaConf.to_container(
+-            config.global_profiler.global_tool_config.nsys.controller_nsight_options
+-        )
+-        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
+-    else:
+-        runner = task_runner_class.remote()
+-    ray.get(runner.run.remote(config))
+-
+-    # [Optional] get the path of the timeline trace file from the configuration, default to None
+-    # This file is used for performance analysis
+-    timeline_json_file = config.ray_kwargs.get("timeline_json_file", None)
+-    if timeline_json_file:
+-        ray.timeline(filename=timeline_json_file)
++        started_local_ray = True
++
++    try:
++        # Create a remote instance of the TaskRunner class, and
++        # execute the `run` method while preserving remote failures.
++        if (
++            is_cuda_available
++            and config.global_profiler.tool == "nsys"
++            and config.global_profiler.get("steps") is not None
++            and len(config.global_profiler.get("steps", [])) > 0
++        ):
++            from verl.utils.import_utils import is_nvtx_available
++
++            assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
++            nsight_options = OmegaConf.to_container(
++                config.global_profiler.global_tool_config.nsys.controller_nsight_options
++            )
++            runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
++        else:
++            runner = task_runner_class.remote()
++        ray.get(runner.run.remote(config))
++
++        # [Optional] get the path of the timeline trace file from the configuration, default to None
++        timeline_json_file = config.ray_kwargs.get("timeline_json_file", None)
++        if timeline_json_file:
++            ray.timeline(filename=timeline_json_file)
++    finally:
++        # Do not tear down a cluster supplied by an external caller.
++        if started_local_ray and ray.is_initialized():
++            ray.shutdown()
+
+
+ @ray.remote
+diff --git a/verl/trainer/main_ppo_v0.py b/verl/trainer/main_ppo_v0.py
+index ded13904..08fc9450 100644
+--- a/verl/trainer/main_ppo_v0.py
++++ b/verl/trainer/main_ppo_v0.py
+@@ -21,7 +21,7 @@ import socket
+ import ray
+ from omegaconf import OmegaConf
+
+-from verl.trainer.distillation import is_distillation_enabled
++from verl.trainer.distillation import is_distillation_enabled, is_distillation_only
+ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+ from verl.trainer.ppo.utils import create_rl_dataset, create_rl_sampler, need_critic, need_reference_policy
+ from verl.utils.config import validate_config
+@@ -45,8 +45,9 @@ class BaseTaskRunner:
+         if lora_rank <= 0:
+             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+         ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
++        distillation_only = is_distillation_only(config.get("distillation"))
+         # Ref policy is fused into ActorRolloutRefWorker unless LoRA is used with a dedicated ref model.
+-        if need_reference_policy(config) and not ref_in_actor:
++        if need_reference_policy(config) and not ref_in_actor and not distillation_only:
+             role = Role.ActorRolloutRef
+         else:
+             role = Role.ActorRollout
+@@ -180,7 +181,8 @@ class TaskRunner(BaseTaskRunner):
+         # validate config
+         validate_config(
+             config=config,
+-            use_reference_policy=need_reference_policy(config),
++            use_reference_policy=need_reference_policy(config)
++            and not is_distillation_only(config.get("distillation")),
+             use_critic=need_critic(config),
+         )
+
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 908d36b2..08671144 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -38,7 +38,7 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+ from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
+ from verl.single_controller.ray.base import create_colocated_worker_cls
+ from verl.trainer.config import AlgoConfig
+-from verl.trainer.distillation.losses import is_distillation_enabled
++from verl.trainer.distillation.losses import is_distillation_enabled, is_distillation_only
+ from verl.trainer.ppo import core_algos
+ from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+ from verl.trainer.ppo.metric_utils import (
+@@ -340,12 +340,20 @@ class RayPPOTrainer:
+
+         self.role_worker_mapping = role_worker_mapping
+         self.resource_pool_manager = resource_pool_manager
+-        self.use_reference_policy = need_reference_policy(self.config)
++        self.distillation_only = is_distillation_only(self.config.get("distillation"))
++        self.use_reference_policy = need_reference_policy(self.config) and not self.distillation_only
+         self.use_teacher_policy = need_teacher_policy(self.config)
+
+-        self.use_rm = need_reward_model(self.config)
++        # Pure top-k distillation has no task-reward objective.  A legacy
++        # launcher may nevertheless have constructed a reward_pool before it
++        # instantiated this trainer; disable that pool before init_workers()
++        # creates any placement groups.  Keeping use_rm false also prevents a
++        # reward actor/manager from being wired into the agent loop.
++        self.use_rm = need_reward_model(self.config) and not self.distillation_only
++        if self.distillation_only:
++            self._disable_pure_distillation_reward_resources()
+
+-        self.use_critic = need_critic(self.config)
++        self.use_critic = need_critic(self.config) and not self.distillation_only
+         self.ray_worker_group_cls = ray_worker_group_cls
+         self.device_name = device_name if device_name else self.config.trainer.device
+         self.validation_generations_logger = ValidationGenerationsLogger(
+@@ -367,10 +375,29 @@ class RayPPOTrainer:
+         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
+
+         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+-
+         self.checkpoint_manager = None
+         self._init_dump_executor()
+
++    def _disable_pure_distillation_reward_resources(self) -> None:
++        """Remove legacy reward resources before Ray placement-group creation.
++
++        ``main_ppo_v0`` builds the ResourcePoolManager before constructing the
++        trainer.  Mutating the still-unstarted manager here closes that gap for
++        pure distillation without changing non-pure reward behavior.  If a
++        caller already created pools, fail closed instead of claiming that the
++        reward resources were not reserved.
++        """
++        manager = self.resource_pool_manager
++        resource_pool_dict = getattr(manager, "resource_pool_dict", {})
++        if resource_pool_dict:
++            raise RuntimeError("Pure distillation received a ResourcePoolManager after resource-pool creation")
++        resource_pool_spec = getattr(manager, "resource_pool_spec", None)
++        if isinstance(resource_pool_spec, dict):
++            resource_pool_spec.pop("reward_pool", None)
++        mapping = getattr(manager, "mapping", None)
++        if isinstance(mapping, dict):
++            mapping.pop(Role.RewardModel, None)
++
+     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
+         """
+         Creates the train and validation dataloaders.
+@@ -524,7 +551,14 @@ class RayPPOTrainer:
+         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+-            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
++            if self.distillation_only:
++                scores = [None] * len(inputs)
++                reward_extra_infos_dict = {
++                    **reward_extra_infos_dict,
++                    "reward_status": ["unavailable"] * len(inputs),
++                }
++            else:
++                scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
+
+             reward_extra_infos_to_dump = {
+@@ -593,6 +627,117 @@ class RayPPOTrainer:
+         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
+         return batch_reward
+
++    def _prepare_batch_for_actor(self, batch: DataProto, metrics: dict, timing_raw: dict):
++        """Run reward/PPO preparation, or bypass it for pure distillation.
++
++        The legacy trainer historically assumed that every actor update had
++        ``rm_scores`` and advantage fields.  Pure top-k distillation owns a
++        different objective: the rollout still carries teacher top-k fields,
++        but it deliberately has no task reward, old/ref policy, critic, or
++        advantage tensors.  Keep the complete legacy path in one helper so a
++        pure call can return before any of those stages are entered.
++        """
++        if self.distillation_only:
++            return batch, {}
++
++        with marked_timer("reward", timing_raw, color="yellow"):
++            if self.use_rm and "rm_scores" not in batch.batch.keys():
++                batch_reward = self._compute_reward_colocate(batch)
++                batch = batch.union(batch_reward)
++            reward_tensor, reward_extra_infos_dict = extract_reward(batch)
++
++        # Operating Mode Selection:
++        # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies:
++        #   pi_rollout, pi_theta)
++        # - Decoupled mode: recomputes old_log_probs as a proximal anchor.
++        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
++        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
++        if bypass_recomputing_logprobs:
++            from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
++
++            apply_bypass_mode(
++                batch=batch,
++                rollout_corr_config=rollout_corr_config,
++                policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
++            )
++        else:
++            with marked_timer("old_log_prob", timing_raw, color="blue"):
++                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
++                entropys = old_log_prob.batch["entropys"]
++                response_masks = batch.batch["response_mask"]
++                actor_config = self.config.actor_rollout_ref.actor
++                entropy_agg = agg_loss(
++                    loss_mat=entropys,
++                    loss_mask=response_masks,
++                    loss_agg_mode=actor_config.loss_agg_mode,
++                    loss_scale_factor=actor_config.loss_scale_factor,
++                )
++                metrics.update(
++                    {
++                        "actor/entropy": entropy_agg.detach().item(),
++                        "perf/mfu/actor_infer": old_log_prob_mfu,
++                    }
++                )
++                old_log_prob.batch.pop("entropys")
++                if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
++                    raise ValueError(
++                        "Detected conflicting router replay configuration: "
++                        "router_replay.mode='R2' and enable_rollout_routing_replay=True "
++                        "cannot be enabled simultaneously. The enable_rollout_routing_replay "
++                        "option is only used in R3 mode; it should not be set when using R2 mode."
++                    )
++                batch = batch.union(old_log_prob)
++                if "rollout_log_probs" in batch.batch.keys():
++                    from verl.utils.debug.metrics import calculate_debug_metrics
++
++                    metrics.update(calculate_debug_metrics(batch))
++
++        assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
++        if self.use_reference_policy:
++            with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
++                ref_log_prob = self._compute_ref_log_prob(batch)
++                batch = batch.union(ref_log_prob)
++
++        if self.use_critic:
++            with marked_timer("values", timing_raw, color="cyan"):
++                values = self._compute_values(batch)
++                batch = batch.union(values)
++
++        with marked_timer("adv", timing_raw, color="brown"):
++            batch.batch["token_level_scores"] = reward_tensor
++            if reward_extra_infos_dict:
++                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
++
++            if self.config.algorithm.use_kl_in_reward:
++                batch, kl_metrics = apply_kl_penalty(
++                    batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
++                )
++                metrics.update(kl_metrics)
++            else:
++                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
++
++            if (
++                rollout_corr_config is not None
++                and "rollout_log_probs" in batch.batch
++                and not bypass_recomputing_logprobs
++            ):
++                from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
++
++                batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
++                metrics.update(is_metrics)
++
++            norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
++            batch = compute_advantage(
++                batch,
++                adv_estimator=self.config.algorithm.adv_estimator,
++                gamma=self.config.algorithm.gamma,
++                lam=self.config.algorithm.lam,
++                num_repeat=self.config.actor_rollout_ref.rollout.n,
++                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
++                config=self.config.algorithm,
++            )
++        return batch, reward_extra_infos_dict
++
+     def _validate(self, merged: bool = False):
+         data_source_lst = []
+         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+@@ -669,6 +814,20 @@ class RayPPOTrainer:
+             sample_inputs.extend(input_texts)
+             sample_uids.extend(test_batch.non_tensor_batch["uid"])
+
++            if self.distillation_only:
++                # Pure distillation has no task-reward contract.  Do not call
++                # extract_reward (which would raise KeyError when rm_scores
++                # are correctly absent), and do not turn a synthetic zero
++                # into a validation score.  ``None`` is persisted by the
++                # generation dump as an explicit unavailable value.
++                n_samples = len(test_batch.batch)
++                sample_scores.extend([None] * n_samples)
++                reward_extra_infos_dict["reward_status"].extend(["unavailable"] * n_samples)
++                if "__num_turns__" in test_batch.non_tensor_batch:
++                    sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
++                data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * n_samples))
++                continue
++
+             # evaluate using reward_function
+             reward_tensor, reward_extra_info = extract_reward(test_batch)
+
+@@ -690,7 +849,8 @@ class RayPPOTrainer:
+
+             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+
+-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
++        if not self.distillation_only:
++            self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+         # dump generations
+         val_data_dir = self.config.trainer.get("validation_data_dir", None)
+@@ -707,6 +867,13 @@ class RayPPOTrainer:
+         for key_info, lst in reward_extra_infos_dict.items():
+             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+
++        if self.distillation_only:
++            return {
++                "val/reward/available": False,
++                "val/reward/status": "unavailable",
++                "val/samples": len(sample_scores),
++            }
++
+         if merged:
+             print("_merge_validation_results validate result will be merged")
+             return {
+@@ -746,6 +913,14 @@ class RayPPOTrainer:
+         return metric_dict
+
+     def _merge_validation_results(self, result_a, result_b):
++        if self.distillation_only:
++            samples_a = result_a.get("val/samples", 0) if isinstance(result_a, dict) else 0
++            samples_b = result_b.get("val/samples", 0) if isinstance(result_b, dict) else 0
++            return {
++                "val/reward/available": False,
++                "val/reward/status": "unavailable",
++                "val/samples": samples_a + samples_b,
++            }
+         if result_a is None and result_b is None:
+             return {}
+         if result_a is None:
+@@ -956,7 +1131,9 @@ class RayPPOTrainer:
+         # to stream reward computation with actor rollout
+         # To stream teacher computation with actor rollout, we instead pass the full manager so that the
+         # teacher loop workers can sleep/wake together with rollout workers
+-        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
++        reward_loop_worker_handles = (
++            self.reward_loop_manager.reward_loop_worker_handles if enable_agent_reward_loop else None
++        )
+         self.async_rollout_manager = AgentLoopManager.create(
+             config=self.config,
+             llm_client=self.llm_server_manager.get_client(),
+@@ -1316,14 +1493,7 @@ class RayPPOTrainer:
+             if is_distillation_enabled(self.config.get("distillation"))
+             else False
+         )
+-        distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
+-        if is_distillation_enabled(self.config.get("distillation")):
+-            distillation_loss_cfg = self.distillation_config.distillation_loss
+-            distillation_only = (
+-                distillation_use_topk
+-                and not distillation_loss_cfg.use_task_rewards
+-                and not distillation_loss_cfg.use_policy_gradient
+-            )
++        distillation_only = is_distillation_only(self.config.get("distillation"))
+         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
+@@ -1465,7 +1635,7 @@ class RayPPOTrainer:
+                 rollout_n = self.config.actor_rollout_ref.rollout.n
+                 gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+
+-                if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
++                if not self.distillation_only and self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                     # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
+                     # Keep them in a single agent-loop/vLLM request to avoid sending a second
+                     # rollout after replicas have been put to sleep, which can leave async vLLM
+@@ -1497,7 +1667,7 @@ class RayPPOTrainer:
+                     if "__do_sample__" in gen_batch_output.non_tensor_batch:
+                         gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
+
+-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
++                    if not self.distillation_only and self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                         gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)
+                         if "__do_sample__" in gen_baseline_output.non_tensor_batch:
+                             gen_baseline_output.pop(non_tensor_batch_keys=["__do_sample__"])
+@@ -1533,121 +1703,14 @@ class RayPPOTrainer:
+                             continue
+                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
+                     batch.meta_info["images_seqlens"] = images_seqlens_all
+-                    with marked_timer("reward", timing_raw, color="yellow"):
+-                        # compute reward model score
+-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
+-                            batch_reward = self._compute_reward_colocate(batch)
+-                            batch = batch.union(batch_reward)
+-
+-                        # extract reward_tensor and reward_extra_infos_dict for training
+-                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+-
+-                    # Operating Mode Selection:
+-                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+-                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+-                    #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+-                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+-                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+-                        from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+-
+-                        apply_bypass_mode(
+-                            batch=batch,
+-                            rollout_corr_config=rollout_corr_config,
+-                            policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
+-                        )
+-                    else:  # Recompute old_log_probs
+-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
+-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+-                            entropys = old_log_prob.batch["entropys"]
+-                            response_masks = batch.batch["response_mask"]
+-                            actor_config = self.config.actor_rollout_ref.actor
+-                            entropy_agg = agg_loss(
+-                                loss_mat=entropys,
+-                                loss_mask=response_masks,
+-                                loss_agg_mode=actor_config.loss_agg_mode,
+-                                loss_scale_factor=actor_config.loss_scale_factor,
+-                            )
+-                            old_log_prob_metrics = {
+-                                "actor/entropy": entropy_agg.detach().item(),
+-                                "perf/mfu/actor_infer": old_log_prob_mfu,
+-                            }
+-                            metrics.update(old_log_prob_metrics)
+-                            old_log_prob.batch.pop("entropys")
+-                            if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
+-                                raise ValueError(
+-                                    "Detected conflicting router replay configuration: "
+-                                    "router_replay.mode='R2' and enable_rollout_routing_replay=True "
+-                                    "cannot be enabled simultaneously. "
+-                                    "The enable_rollout_routing_replay option is only used in R3 mode; "
+-                                    "it should not be set when using R2 mode."
+-                                )
+-                            batch = batch.union(old_log_prob)
+-                            if "rollout_log_probs" in batch.batch.keys():
+-                                # TODO: we may want to add diff of probs too.
+-                                from verl.utils.debug.metrics import calculate_debug_metrics
+-
+-                                metrics.update(calculate_debug_metrics(batch))
+-
+-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+-                    if self.use_reference_policy:
+-                        # compute reference log_prob
+-                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+-                            ref_log_prob = self._compute_ref_log_prob(batch)
+-                            batch = batch.union(ref_log_prob)
+-
+-                    # compute values
+-                    if self.use_critic:
+-                        with marked_timer("values", timing_raw, color="cyan"):
+-                            values = self._compute_values(batch)
+-                            batch = batch.union(values)
+-
+-                    with marked_timer("adv", timing_raw, color="brown"):
+-                        # we combine with rule-based rm
+-                        reward_extra_infos_dict: dict[str, list]
+-                        batch.batch["token_level_scores"] = reward_tensor
+-
+-                        if reward_extra_infos_dict:
+-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+-
+-                        # compute rewards. apply_kl_penalty if available
+-                        if self.config.algorithm.use_kl_in_reward:
+-                            batch, kl_metrics = apply_kl_penalty(
+-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+-                            )
+-                            metrics.update(kl_metrics)
+-                        else:
+-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+-
+-                        # Compute rollout correction: IS weights, rejection sampling, and metrics
+-                        # Only runs in decoupled mode (computes once per batch using stable π_old)
+-                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+-                        if (
+-                            rollout_corr_config is not None
+-                            and "rollout_log_probs" in batch.batch
+-                            and not bypass_recomputing_logprobs  # Only in decoupled mode
+-                        ):
+-                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+-
+-                            # Compute IS weights, apply rejection sampling, compute metrics
+-                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+-                            # IS and off-policy metrics already have rollout_corr/ prefix
+-                            metrics.update(is_metrics)
+-
+-                        # compute advantages, executed on the driver process
+-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
+-                            "norm_adv_by_std_in_grpo", True
+-                        )  # GRPO adv normalization factor
+-
+-                        batch = compute_advantage(
+-                            batch,
+-                            adv_estimator=self.config.algorithm.adv_estimator,
+-                            gamma=self.config.algorithm.gamma,
+-                            lam=self.config.algorithm.lam,
+-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+-                            config=self.config.algorithm,
+-                        )
++                    batch, reward_extra_infos_dict = self._prepare_batch_for_actor(batch, metrics, timing_raw)
++
++                    # The reward/PPO preparation helper is a no-op for pure
++                    # distillation; that path proceeds directly to the actor
++                    # update below with teacher top-k fields intact.
++                    # Reward/PPO preparation already ran above.  The helper
++                    # keeps all reward stages out of pure distillation.
++
+                     # update critic
+                     if self.use_critic:
+                         with marked_timer("update_critic", timing_raw, color="pink"):
+@@ -1656,7 +1719,7 @@ class RayPPOTrainer:
+                         metrics.update(critic_output_metrics)
+
+                     # implement critic warmup
+-                    if self.config.trainer.critic_warmup > self.global_steps:
++                    if not self.distillation_only and self.config.trainer.critic_warmup > self.global_steps:
+                         # Still in critic warmup, only update weights to wake up rollout replicas.
+                         self.checkpoint_manager.update_weights(self.global_steps)
+                     else:
+@@ -1732,8 +1795,19 @@ class RayPPOTrainer:
+                         "training/epoch": epoch,
+                     }
+                 )
+-                # collect metrics
+-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
++                # Pure distillation has no task reward/advantage metrics.  Do
++                # not call compute_data_metrics with missing fields, and make
++                # the absence explicit rather than logging synthetic zeros as
++                # if they were measured rewards.
++                if self.distillation_only:
++                    metrics.update(
++                        {
++                            "training/reward_available": False,
++                            "training/reward_status": "unavailable",
++                        }
++                    )
++                else:
++                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                 # GDPO per-component reward metrics
+                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
+                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
+diff --git a/verl/trainer/ppo/v1/agent_loop_tq.py b/verl/trainer/ppo/v1/agent_loop_tq.py
+index 5e147eef..f2f16585 100644
+--- a/verl/trainer/ppo/v1/agent_loop_tq.py
++++ b/verl/trainer/ppo/v1/agent_loop_tq.py
+@@ -31,6 +31,7 @@ from verl.experimental.agent_loop import (
+     AgentLoopWorker,
+     get_trajectory_info,
+ )
++from verl.trainer.distillation import is_distillation_only
+ from verl.utils.ray_utils import auto_await
+ from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+
+@@ -38,6 +39,33 @@ logger = logging.getLogger(__name__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
++def _validate_teacher_output_for_tq(
++    output: AgentLoopOutput,
++    *,
++    require_teacher_input_evidence: bool,
++) -> None:
++    """Fail at the producer boundary when teacher rows cannot align to this trajectory."""
++    teacher_ids = output.extra_fields.get("teacher_ids")
++    teacher_logprobs = output.extra_fields.get("teacher_logprobs")
++    if not isinstance(teacher_ids, torch.Tensor) or not isinstance(teacher_logprobs, torch.Tensor):
++        raise TypeError("Distillation rollout must contain tensor teacher_ids and teacher_logprobs")
++    if teacher_ids.ndim != 2 or teacher_ids.shape != teacher_logprobs.shape:
++        raise ValueError(
++            "Teacher ids/logprobs must have one identical [sequence, distribution] shape: "
++            f"{tuple(teacher_ids.shape)} != {tuple(teacher_logprobs.shape)}"
++        )
++    expected_sequence_length = len(output.prompt_ids) + len(output.response_ids)
++    if teacher_ids.shape[0] != expected_sequence_length:
++        raise ValueError(
++            "Teacher rows must align to the unpadded student prompt plus response before TransferQueue: "
++            f"{teacher_ids.shape[0]} != {len(output.prompt_ids)} + {len(output.response_ids)}"
++        )
++    if require_teacher_input_evidence and not isinstance(
++        output.extra_fields.get("teacher_input_evidence"), dict
++    ):
++        raise ValueError("Privileged distillation rollout has no teacher_input_evidence object")
++
++
+ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
+     params["top_p"] = 1.0
+     params["top_k"] = -1
+@@ -137,7 +165,13 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+             logger.warning(f"Empty output for prompt {uid}_{session_id}")
+             return
+
+-        await self._compute_score(outputs, kwargs=kwargs)
++        distillation_only = getattr(
++            self,
++            "distillation_only",
++            is_distillation_only(getattr(self, "distillation_config", None)),
++        )
++        if not distillation_only:
++            await self._compute_score(outputs, kwargs=kwargs)
+
+         final_output = outputs[-1]
+         # TODO: Support output:list[AgentLoopOutput]
+@@ -148,6 +182,17 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+             validate=validate,
+             sample_kwargs=kwargs,
+         )
++        if self.distillation_enabled and not validate:
++            if len(outputs) != 1:
++                raise NotImplementedError(
++                    "Distillation TransferQueue currently supports exactly one AgentLoopOutput per trajectory"
++                )
++            _validate_teacher_output_for_tq(
++                final_output,
++                require_teacher_input_evidence=bool(
++                    self.distillation_config.teacher_image_key
++                ),
++            )
+
+         if final_output.reward_score is not None:
+             for output in outputs[:-1]:
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index e07b8166..d7c950a3 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+
++import hashlib
+ import json
+ import logging
+ import math
+@@ -41,13 +42,14 @@ from verl.experimental.agent_loop import AgentLoopManager
+ from verl.experimental.reward_loop import RewardLoopManager
+ from verl.experimental.teacher_loop import MultiTeacherModelManager
+ from verl.protocol import DataProto, DataProtoFuture
++from verl.single_controller.base.worker import validate_role_gpu_partition
+ from verl.single_controller.ray import (
+     RayClassWithInitArgs,
+     RayWorkerGroup,
+     ResourcePoolManager,
+     create_colocated_worker_cls,
+ )
+-from verl.trainer.distillation import is_distillation_enabled
++from verl.trainer.distillation import is_distillation_enabled, is_distillation_only
+ from verl.trainer.ppo import core_algos
+ from verl.trainer.ppo.core_algos import agg_loss
+ from verl.trainer.ppo.metric_utils import (
+@@ -104,6 +106,37 @@ logger = logging.getLogger(__name__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
++def _normalize_explicit_save_steps(value: Any, total_training_steps: int) -> frozenset[int]:
++    """Validate optional exact checkpoint steps used by the v1 trainer.
++
++    ``save_freq`` remains fully backward compatible. ``trainer.save_steps``
++    is an opt-in list for experiments whose meaningful checkpoints do not
++    form one constant interval.
++    """
++
++    if value is None:
++        return frozenset()
++    if isinstance(value, (str, bytes)):
++        raise ValueError("trainer.save_steps must be a sequence of positive integers")
++    try:
++        raw_steps = list(value)
++    except TypeError as exc:
++        raise ValueError("trainer.save_steps must be a sequence of positive integers") from exc
++    steps: set[int] = set()
++    for raw in raw_steps:
++        if isinstance(raw, bool) or not isinstance(raw, int):
++            raise ValueError("trainer.save_steps must contain only integers")
++        if raw <= 0 or raw > total_training_steps:
++            raise ValueError(f"trainer.save_steps entry {raw} is outside [1, {total_training_steps}]")
++        steps.add(raw)
++    return frozenset(steps)
++
++
++def _normalize_tq_non_tensor_sequence(value: Any) -> list[Any]:
++    """Normalize TransferQueue non-tensor containers without assuming ``.tolist()``."""
++    return [item.data if isinstance(item, NonTensorData) else item for item in list(value)]
++
++
+ def _tq_supports_checkpoint() -> bool:
+     """Whether the installed TransferQueue can snapshot/restore its state for checkpoint consistency."""
+     try:
+@@ -117,6 +150,189 @@ def _tq_supports_checkpoint() -> bool:
+     )
+
+
++def _fsync_directory(path: str) -> None:
++    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
++    try:
++        os.fsync(descriptor)
++    finally:
++        os.close(descriptor)
++
++
++def _fsync_tree(path: str) -> None:
++    """Durably flush a completed checkpoint tree and reject symlink aliases."""
++    directories = []
++    for root, dirnames, filenames in os.walk(path):
++        directories.append(root)
++        for name in dirnames + filenames:
++            entry = os.path.join(root, name)
++            if os.path.islink(entry):
++                raise RuntimeError(f"Checkpoint tree contains a symlink: {entry}")
++        for filename in filenames:
++            descriptor = os.open(os.path.join(root, filename), os.O_RDONLY)
++            try:
++                os.fsync(descriptor)
++            finally:
++                os.close(descriptor)
++    for directory in reversed(directories):
++        _fsync_directory(directory)
++
++
++def _atomic_write_bytes(path: str, payload: bytes) -> None:
++    """Durably replace a small commit/metadata file on the same filesystem."""
++    parent = os.path.dirname(path)
++    os.makedirs(parent, exist_ok=True)
++    temporary = os.path.join(parent, f".{os.path.basename(path)}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
++    try:
++        with open(temporary, "xb") as handle:
++            handle.write(payload)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary, path)
++        _fsync_directory(parent)
++    finally:
++        if os.path.exists(temporary):
++            os.unlink(temporary)
++
++
++def _canonical_json_bytes(document: dict[str, Any]) -> bytes:
++    return json.dumps(
++        document,
++        ensure_ascii=False,
++        allow_nan=False,
++        sort_keys=True,
++        separators=(",", ":"),
++    ).encode("utf-8")
++
++
++def _write_role_gpu_partition_receipt(path: str, document: dict[str, Any]) -> dict[str, Any]:
++    """Publish one private, create-once, durably sealed role-GPU receipt."""
++    if not os.path.isabs(path):
++        raise RuntimeError("role GPU partition receipt path must be absolute")
++    parent = os.path.dirname(path)
++    if not os.path.isdir(parent):
++        raise RuntimeError(f"role GPU partition receipt directory is unavailable: {parent}")
++    seal = hashlib.sha256(_canonical_json_bytes(document)).hexdigest()
++    complete = {**document, "seal_sha256": seal}
++    raw = _canonical_json_bytes(complete) + b"\n"
++    temporary = os.path.join(parent, f".{os.path.basename(path)}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
++    descriptor = None
++    created_temporary = False
++    try:
++        descriptor = os.open(
++            temporary,
++            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
++            0o600,
++        )
++        created_temporary = True
++        with os.fdopen(descriptor, "wb") as handle:
++            descriptor = None
++            handle.write(raw)
++            handle.flush()
++            os.fchmod(handle.fileno(), 0o600)
++            os.fsync(handle.fileno())
++        # Hard-link publication is atomic and create-once: unlike os.replace it
++        # cannot overwrite a receipt from another attempt.
++        os.link(temporary, path)
++        os.unlink(temporary)
++        _fsync_directory(parent)
++    except FileExistsError as error:
++        if not created_temporary:
++            raise RuntimeError(f"role GPU partition temporary path collision: {temporary}") from error
++        raise RuntimeError(f"role GPU partition receipt already exists: {path}") from error
++    finally:
++        if descriptor is not None:
++            os.close(descriptor)
++        if created_temporary and os.path.lexists(temporary):
++            os.unlink(temporary)
++    return complete
++
++
++def _collect_role_gpu_partition_receipt(
++    config: DictConfig,
++    actor_worker_group: Any,
++    teacher_workers: list[Any],
++) -> dict[str, Any]:
++    """Probe both prepared worker groups and publish the pre-model receipt."""
++    trainer_config = config.trainer
++    student_config = trainer_config.get("student_physical_gpus")
++    teacher_config = trainer_config.get("teacher_physical_gpus")
++    try:
++        student_physical_gpus = list(student_config)
++        teacher_physical_gpus = list(teacher_config)
++    except TypeError as error:
++        raise RuntimeError("role GPU partition lists are required") from error
++    if student_physical_gpus != [0, 1, 2, 3] or teacher_physical_gpus != [4, 5, 6, 7]:
++        raise RuntimeError("role GPU partition must be student 0-3 and teacher 4-7")
++    receipt_path = trainer_config.get("role_gpu_partition_receipt_path")
++    if not isinstance(receipt_path, str) or not os.path.isabs(receipt_path):
++        raise RuntimeError("role GPU partition receipt path must be an absolute string")
++
++    observations: list[dict[str, Any]] = []
++    # Actor/critic groups are often fused WorkerDict actors.  Their public
++    # method is rebound on RayWorkerGroup, while the raw actor handle exposes
++    # only the role-prefixed method.  Use the group dispatch path for students
++    # and raw handles for the standalone teacher rollout workers.
++    student_observations = actor_worker_group.get_role_gpu_observation()
++    for observation in student_observations:
++        record = dict(observation)
++        record["role"] = "student"
++        observations.append(record)
++    teacher_references = [worker.get_role_gpu_observation.remote() for worker in teacher_workers]
++    for observation in ray.get(teacher_references):
++        record = dict(observation)
++        record["role"] = "teacher"
++        observations.append(record)
++    validated = validate_role_gpu_partition(
++        observations,
++        student_physical_gpus=student_physical_gpus,
++        teacher_physical_gpus=teacher_physical_gpus,
++        require_gpu_uuid=True,
++    )
++    receipt_observations = []
++    for observation in validated["observations"]:
++        receipt_observations.append(
++            {
++                "role": observation["role"],
++                "rank": observation["rank"],
++                "pid": observation["pid"],
++                "node_id": observation["node_id"],
++                "ray_accelerator_ids": observation["ray_accelerator_ids"],
++                "cuda_visible_devices": observation["cuda_visible_devices"],
++                "physical_gpu": observation["physical_gpu"],
++                "gpu_uuid": observation["gpu_uuid"],
++            }
++        )
++    document = {
++        "schema_version": "verl_role_gpu_partition_v1",
++        "status": "passed_pre_model_role_gpu_partition",
++        "gate_phase": "before_any_model_initialization",
++        "receipt_path": receipt_path,
++        "expected": {"student": [0, 1, 2, 3], "teacher": [4, 5, 6, 7]},
++        "node_id": validated["node_id"],
++        "observations": receipt_observations,
++        "student_model_initialized": False,
++        "teacher_servers_launched": False,
++    }
++    return _write_role_gpu_partition_receipt(receipt_path, document)
++
++
++def _atomic_torch_save(payload: Any, path: str) -> None:
++    """torch.save to a same-directory temporary file before atomic publication."""
++    parent = os.path.dirname(path)
++    os.makedirs(parent, exist_ok=True)
++    temporary = os.path.join(parent, f".{os.path.basename(path)}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
++    try:
++        with open(temporary, "xb") as handle:
++            torch.save(payload, handle)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary, path)
++        _fsync_directory(parent)
++    finally:
++        if os.path.exists(temporary):
++            os.unlink(temporary)
++
++
+ class PPOTrainer(ABC):
+     """Base class for PPO trainer.
+
+@@ -126,8 +342,9 @@ class PPOTrainer(ABC):
+
+     def __init__(self, config: DictConfig):
+         self.config = config
+-        self.use_critic = need_critic(self.config)
+-        self.use_reference_policy = need_reference_policy(self.config)
++        self.distillation_only = is_distillation_only(self.config.get("distillation"))
++        self.use_critic = False if self.distillation_only else need_critic(self.config)
++        self.use_reference_policy = False if self.distillation_only else need_reference_policy(self.config)
+         self.use_teacher_policy = need_teacher_policy(self.config)
+         if self.config.algorithm.use_kl_in_reward:
+             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
+@@ -246,6 +463,25 @@ class PPOTrainer(ABC):
+             all_wg.update(spawn_wg)
+             logger.info(f"create worker group {spawn_wg.keys()}")
+
++        self.actor_rollout_wg = all_wg[str(actor_role)]
++        deferred_teacher_servers = False
++        if self.config.trainer.get("require_role_gpu_partition", False):
++            if not self.use_teacher_policy:
++                raise RuntimeError("role GPU partition requires an enabled teacher policy")
++            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
++            self.teacher_model_manager = MultiTeacherModelManager(
++                config=self.config,
++                resource_pool=teacher_resource_pool,
++                defer_server_launch=True,
++            )
++            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
++            deferred_teacher_servers = True
++            _collect_role_gpu_partition_receipt(
++                self.config,
++                self.actor_rollout_wg,
++                self.teacher_model_manager.worker_handles,
++            )
++
+         # 5. initialize critic model engine
+         if self.use_critic:
+             self.critic_wg = all_wg[str(Role.Critic)]
+@@ -255,7 +491,6 @@ class PPOTrainer(ABC):
+             logger.info("critic model engine initialized")
+
+         # 6. initialize actor and ref model engine
+-        self.actor_rollout_wg = all_wg[str(actor_role)]
+         self.actor_rollout_wg.init_model()
+         logger.info("actor and ref model engine initialized")
+
+@@ -272,7 +507,7 @@ class PPOTrainer(ABC):
+         # 7. initialize reward loop manager
+         resource_pool = (
+             self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+-            if self.config.reward.reward_model.enable
++            if self.config.reward.reward_model.enable and not self.distillation_only
+             else None
+         )
+         self.reward_loop_manager = RewardLoopManager(
+@@ -283,12 +518,15 @@ class PPOTrainer(ABC):
+
+         # 8. initialize teacher loop manager
+         if self.use_teacher_policy:
+-            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+-            self.teacher_model_manager = MultiTeacherModelManager(
+-                config=self.config,
+-                resource_pool=teacher_resource_pool,
+-            )
+-            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
++            if deferred_teacher_servers:
++                self.teacher_model_manager.launch_servers()
++            else:
++                teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
++                self.teacher_model_manager = MultiTeacherModelManager(
++                    config=self.config,
++                    resource_pool=teacher_resource_pool,
++                )
++                self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+         else:
+             self.teacher_model_manager = None
+             self.distillation_config = None
+@@ -328,6 +566,8 @@ class PPOTrainer(ABC):
+
+     def get_reward_handles(self) -> list[ray.actor.ActorHandle]:
+         """Get the handles of reward loop workers."""
++        if self.distillation_only:
++            return None
+         return self.reward_loop_manager.reward_loop_worker_handles
+
+     def fit(self, agent_loop_manager: AgentLoopManager):
+@@ -352,96 +592,121 @@ class PPOTrainer(ABC):
+             experiment_name=self.config.trainer.experiment_name,
+         )
+
+-        # perform validation before training
+-        if self.config.trainer.get("val_before_train", True):
+-            self.on_validate_begin()
+-            val_metrics = self._validate()
+-            self.on_validate_end()
+-            assert val_metrics, f"{val_metrics=}"
+-            pprint(f"Initial validation metrics: {val_metrics}")
+-            self.logger.log(data=val_metrics, step=self.global_steps)
+-            if self.config.trainer.get("val_only", False):
+-                self._shutdown_dump_executor()
+-                return
+-
+-        current_epoch = self.global_steps // self.steps_per_epoch
+-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+-
+-        # we start from step 1
+-        self.global_steps += 1
+-        # SkipManager skips warmup batches in async trainers, so it doesn't conflict with reissue.
+-        SkipManager.set_step(self.global_steps)
+-        self._reissue_inflight_prompts()
+-        self.prev_step_profile = False
+-        self.curr_step_profile = (
+-            self.global_steps in self.config.global_profiler.steps
+-            if self.config.global_profiler.steps is not None
+-            else False
+-        )
+-        self.next_step_profile = False
+-
+-        self.on_train_begin()
+-        last_val_metrics = None
+-        while current_epoch < self.config.trainer.total_epochs and self.global_steps <= self.total_training_steps:
+-            is_last_step = self.global_steps >= self.total_training_steps
+-            metrics = {}
+-            self.timing_raw = {}
+-
+-            # 1. perform rollout and actor/critic training
+-            with marked_timer("step", self.timing_raw):
+-                self.on_step_begin()
+-
+-                self._start_profiling()
+-                batch = self.step(metrics, self.timing_raw)
+-                self._stop_profiling()
+-
+-                # 2. save checkpoint
+-                if self.config.trainer.save_freq > 0 and (
+-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+-                ):
+-                    with marked_timer("save_checkpoint", self.timing_raw, color="green"):
+-                        self._save_checkpoint()
++        progress_bar = None
++        try:
++            # perform validation before training
++            if self.config.trainer.get("val_before_train", True):
++                self.on_validate_begin()
++                val_metrics = self._validate()
++                self.on_validate_end()
++                assert val_metrics, f"{val_metrics=}"
++                pprint(f"Initial validation metrics: {val_metrics}")
++                self.logger.log(data=val_metrics, step=self.global_steps)
++                if self.config.trainer.get("val_only", False):
++                    return
++
++            current_epoch = self.global_steps // self.steps_per_epoch
++            explicit_save_steps = _normalize_explicit_save_steps(
++                self.config.trainer.get("save_steps", None), self.total_training_steps
++            )
++            if explicit_save_steps:
++                logger.info("Exact checkpoint steps enabled: %s", sorted(explicit_save_steps))
++            progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+-                self.on_step_end()
+-                metrics.update(self._consume_sync_metrics())
++            # we start from step 1
++            self.global_steps += 1
++            # SkipManager skips warmup batches in async trainers, so it doesn't conflict with reissue.
++            SkipManager.set_step(self.global_steps)
++            self._reissue_inflight_prompts()
++            self.prev_step_profile = False
++            self.curr_step_profile = (
++                self.global_steps in self.config.global_profiler.steps
++                if self.config.global_profiler.steps is not None
++                else False
++            )
++            self.next_step_profile = False
++
++            self.on_train_begin()
++            last_val_metrics = None
++            while current_epoch < self.config.trainer.total_epochs and self.global_steps <= self.total_training_steps:
++                is_last_step = self.global_steps >= self.total_training_steps
++                should_save = self.global_steps in explicit_save_steps or (
++                    self.config.trainer.save_freq > 0
++                    and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0)
++                )
++                metrics = {}
++                self.timing_raw = {}
+
+-            # 4. validate
+-            if self.config.trainer.test_freq > 0 and (
+-                is_last_step or self.global_steps % self.config.trainer.test_freq == 0
+-            ):
+-                with marked_timer("testing", self.timing_raw, color="green"):
+-                    self.on_validate_begin()
+-                    val_metrics: dict = self._validate()
+-                    self.on_validate_end()
+-                    if is_last_step:
+-                        last_val_metrics = val_metrics
+-                metrics.update(val_metrics)
++                # 1. perform rollout and actor/critic training
++                with marked_timer("step", self.timing_raw):
++                    self.on_step_begin()
+
+-            # 5. record metrics
+-            self._compute_metrics(batch, metrics, self.timing_raw, global_steps=self.global_steps, epoch=current_epoch)
++                    self._start_profiling()
++                    batch = self.step(metrics, self.timing_raw)
++                    self._stop_profiling()
+
+-            # 6. dump rollout generations if enabled
+-            rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+-            if rollout_data_dir:
+-                self._log_rollout_data(batch, self.timing_raw, rollout_data_dir)
++                    self.on_step_end()
++                    metrics.update(self._consume_sync_metrics())
+
+-            # 7. cleanup transfer queue
+-            tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
++                # 2. validate
++                if self.config.trainer.test_freq > 0 and (
++                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
++                ):
++                    with marked_timer("testing", self.timing_raw, color="green"):
++                        self.on_validate_begin()
++                        val_metrics: dict = self._validate()
++                        self.on_validate_end()
++                        if is_last_step:
++                            last_val_metrics = val_metrics
++                    metrics.update(val_metrics)
++
++                # 3. compute and publish metrics/rollout artifacts before the
++                # checkpoint tracker makes this step resumable.
++                self._compute_metrics(
++                    batch, metrics, self.timing_raw, global_steps=self.global_steps, epoch=current_epoch
++                )
++                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
++                if rollout_data_dir:
++                    self._log_rollout_data(batch, self.timing_raw, rollout_data_dir)
++
++                # 4. cleanup transfer queue and synchronously enqueue metrics.
++                tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
++                self.logger.log(data=metrics, step=self.global_steps)
++
++                # 5. A checkpoint is the commit record for the complete step.
++                # Drain the atomic JSONL write and flush TensorBoard before the
++                # latest-step tracker is atomically replaced. The final writer
++                # is closed before the final checkpoint is published.
++                if should_save:
++                    self._drain_dump_futures()
++                    self.logger.flush()
++                    if is_last_step:
++                        self.logger.finish()
++                    with marked_timer("save_checkpoint", self.timing_raw, color="green"):
++                        self._save_checkpoint()
+
+-            self.logger.log(data=metrics, step=self.global_steps)
+-            progress_bar.update(1)
+-            self.global_steps += 1
+-            SkipManager.set_step(self.global_steps)
+-            current_epoch = (self.global_steps - 1) // self.steps_per_epoch
+-            if is_last_step:
++                progress_bar.update(1)
++                if is_last_step:
++                    self.on_train_end()
++                    pprint(f"Final validation metrics: {last_val_metrics}")
++                    return
++
++                self.global_steps += 1
++                SkipManager.set_step(self.global_steps)
++                current_epoch = (self.global_steps - 1) // self.steps_per_epoch
++
++            self.on_train_end()
++        finally:
++            # Both methods are idempotent. Rollout write failures and explicit
++            # logger close failures remain visible to the driver.
++            try:
+                 self._shutdown_dump_executor()
+-                pprint(f"Final validation metrics: {last_val_metrics}")
+-                progress_bar.close()
+-                return
+-
+-        self.on_train_end()
+-        # Ensure dump executor is shut down when training loop ends without reaching is_last_step
+-        self._shutdown_dump_executor()
++            finally:
++                try:
++                    self.logger.finish()
++                finally:
++                    if progress_bar is not None:
++                        progress_bar.close()
+
+     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
+         train_batch_size = self.config.data.train_batch_size
+@@ -485,8 +750,11 @@ class PPOTrainer(ABC):
+             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+             self.on_sample_end()
+
++        if self.distillation_only and len(batch) == 0:
++            raise RuntimeError("Pure distillation received no completed rollout outputs")
++
+         # 2. [OPTIONAL] compute reward score with colocated reward model
+-        if self.reward_loop_manager.reward_loop_worker_handles is None:
++        if not self.distillation_only and self.reward_loop_manager.reward_loop_worker_handles is None:
+             with marked_timer("reward", timing_raw, color="yellow"):
+                 batch = self._compute_reward_colocate(batch, metrics=metrics)
+
+@@ -494,30 +762,32 @@ class PPOTrainer(ABC):
+         batch = self._balance_batch(batch, metrics=metrics)
+
+         # 4. compute old_log_prob
+-        with marked_timer("old_log_prob", timing_raw, color="blue"):
+-            batch = self._compute_old_log_prob(batch, metrics=metrics)
++        if not self.distillation_only:
++            with marked_timer("old_log_prob", timing_raw, color="blue"):
++                batch = self._compute_old_log_prob(batch, metrics=metrics)
+
+         # 5. [OPTIONAL] compute ref_log_prob
+-        if self.use_reference_policy:
++        if self.use_reference_policy and not self.distillation_only:
+             with marked_timer("ref", timing_raw, color="olive"):
+                 batch = self._compute_ref_log_prob(batch, metrics=metrics)
+
+         # 6. [OPTIONAL] compute critic values
+-        if self.use_critic:
++        if self.use_critic and not self.distillation_only:
+             with marked_timer("values", timing_raw, color="cyan"):
+                 batch = self._compute_values(batch, metrics=metrics)
+
+         # 7. compute advantage and return
+-        with marked_timer("adv", timing_raw, color="brown"):
+-            batch = self._compute_advantage(batch, metrics=metrics)
++        if not self.distillation_only:
++            with marked_timer("adv", timing_raw, color="brown"):
++                batch = self._compute_advantage(batch, metrics=metrics)
+
+         # 8. [OPTIONAL] update critic
+-        if self.use_critic:
++        if self.use_critic and not self.distillation_only:
+             with marked_timer("update_critic", timing_raw, color="pink"):
+                 batch = self._update_critic(batch, metrics=metrics)
+
+         # 9. update actor
+-        if self.config.trainer.critic_warmup <= self.global_steps:
++        if self.distillation_only or self.config.trainer.critic_warmup <= self.global_steps:
+             with marked_timer("update_actor", timing_raw, color="red"):
+                 batch = self._update_actor(batch, metrics=metrics)
+
+@@ -686,12 +956,12 @@ class PPOTrainer(ABC):
+             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+         ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+
+-        role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
++        role = Role.ActorRolloutRef if self.use_reference_policy and not ref_in_actor else Role.ActorRollout
+         self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
+         self.mapping[role] = "global_pool"
+
+         # Add critic worker to mapping.
+-        if need_critic(config):
++        if self.use_critic:
+             self.role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
+             self.mapping[Role.Critic] = "global_pool"
+
+@@ -702,7 +972,7 @@ class PPOTrainer(ABC):
+         }
+
+         # Add separate resource pool for reward model if enabled
+-        if config.reward.reward_model.enable_resource_pool:
++        if not self.distillation_only and config.reward.reward_model.enable_resource_pool:
+             if config.reward.reward_model.n_gpus_per_node <= 0:
+                 raise ValueError("config.reward.reward_model.n_gpus_per_node must be greater than 0")
+             if config.reward.reward_model.nnodes <= 0:
+@@ -711,7 +981,7 @@ class PPOTrainer(ABC):
+             reward_pool = [config.reward.reward_model.n_gpus_per_node] * config.reward.reward_model.nnodes
+             resource_pool_spec["reward_pool"] = reward_pool
+             self.mapping[Role.RewardModel] = "reward_pool"
+-        else:
++        elif not self.distillation_only:
+             config.reward.reward_model.nnodes = config.trainer.nnodes
+             config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
+             self.mapping[Role.RewardModel] = "global_pool"
+@@ -758,6 +1028,26 @@ class PPOTrainer(ABC):
+         self.global_steps = int(global_step_folder.split("global_step_")[-1])
+         logger.info(f"Resuming from {global_step_folder}, setting global step to {self.global_steps}")
+
++        require_atomic_checkpoint = self.config.trainer.get("require_atomic_checkpoint", False)
++        if require_atomic_checkpoint:
++            completion_path = os.path.join(global_step_folder, "checkpoint_complete.json")
++            if not os.path.isfile(completion_path):
++                raise RuntimeError(f"Atomic checkpoint completion marker is missing: {completion_path}")
++            try:
++                with open(completion_path, encoding="utf-8") as handle:
++                    completion = json.load(handle)
++            except Exception as exc:
++                raise RuntimeError(f"Unable to read checkpoint completion marker {completion_path}: {exc}") from exc
++            expected_world_size = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
++            if (
++                completion.get("status") != "complete"
++                or completion.get("global_step") != self.global_steps
++                or completion.get("world_size") != expected_world_size
++            ):
++                raise RuntimeError(
++                    f"Checkpoint completion marker differs from the resume contract: {completion_path}: {completion}"
++                )
++
+         # 2. load actor checkpoint
+         self.actor_rollout_wg.load_checkpoint(
+             local_path=os.path.join(global_step_folder, "actor"),
+@@ -776,6 +1066,8 @@ class PPOTrainer(ABC):
+         if os.path.exists(dataloader_local_path):
+             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+             self.train_dataloader.load_state_dict(dataloader_state_dict)
++        elif require_atomic_checkpoint:
++            raise RuntimeError(f"Required dataloader state is missing: {dataloader_local_path}")
+         else:
+             logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+@@ -873,10 +1165,11 @@ class PPOTrainer(ABC):
+                 critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+             )
+
+-        # save dataloader state
++        # Save dataloader state atomically. The completion marker and tracker
++        # below are never visible before this replacement has been fsynced.
+         local_mkdir_safe(local_global_step_folder)
+         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
+-        torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
++        _atomic_torch_save(self.train_dataloader.state_dict(), dataloader_local_path)
+
+         # save TransferQueue state for async modes so in-flight prompts (already fetched from the
+         # dataloader but not yet trained into this checkpoint's weights) survive a restart:
+@@ -888,16 +1181,43 @@ class PPOTrainer(ABC):
+                 metadata={"global_steps": self.global_steps},
+             )
+
+-        # write latest checkpointed iteration tracker for atomic resume
++        # Async checkpoint implementations own their publication protocol.
+         actor_ckpt_cfg = self.config.actor_rollout_ref.actor.get("checkpoint", {})
+         if actor_ckpt_cfg.get("async_save", False):
+-            logger.info("skip write latest_checkpointed_iteration.txt when async_save is True")
++            logger.info("skip completion marker and latest checkpoint tracker when async_save is True")
+             return
++
++        # This marker describes a complete local checkpoint. Because
++        # _save_checkpoint is called only after rollout drain and logger flush,
++        # the tracker below commits the entire observable training step.
++        _fsync_tree(actor_local_path)
++        world_size = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
++        actor_inventory = {}
++        for root, _, filenames in os.walk(actor_local_path):
++            for filename in sorted(filenames):
++                path = os.path.join(root, filename)
++                if os.path.isfile(path) and not os.path.islink(path):
++                    actor_inventory[os.path.relpath(path, actor_local_path)] = os.path.getsize(path)
++        completion = {
++            "schema_version": 1,
++            "status": "complete",
++            "global_step": self.global_steps,
++            "world_size": world_size,
++            "dataloader_bytes": os.path.getsize(dataloader_local_path),
++            "actor_file_sizes": actor_inventory,
++        }
++        completion_path = os.path.join(local_global_step_folder, "checkpoint_complete.json")
++        _atomic_write_bytes(
++            completion_path,
++            (json.dumps(completion, indent=2, sort_keys=True) + "\n").encode("utf-8"),
++        )
++
++        # Publish the latest iteration last, using a durable same-directory
++        # replacement rather than truncating the live tracker in place.
+         local_latest_checkpointed_iteration = os.path.join(
+             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
+         )
+-        with open(local_latest_checkpointed_iteration, "w") as f:
+-            f.write(str(self.global_steps))
++        _atomic_write_bytes(local_latest_checkpointed_iteration, f"{self.global_steps}\n".encode("ascii"))
+
+     def _validate(self) -> dict[str, float]:
+         # Lists to collect samples for the table
+@@ -936,7 +1256,7 @@ class PPOTrainer(ABC):
+             )
+
+             # 3. [OPTIONAL] compute reward score with colocated reward model
+-            if self.reward_loop_manager.reward_loop_worker_handles is None:
++            if not self.distillation_only and self.reward_loop_manager.reward_loop_worker_handles is None:
+                 self.checkpoint_manager.sleep_replicas()
+                 batch = self._compute_reward_colocate(batch)
+                 self.checkpoint_manager.update_weights()
+@@ -970,21 +1290,28 @@ class PPOTrainer(ABC):
+             all_inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["prompts"]]
+             all_outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["responses"]]
+
+-            fields = ["uid", "rm_scores", "num_turns", "reward_model", "data_source", "extra_fields"]
++            fields = ["uid", "num_turns", "reward_model", "data_source", "extra_fields"]
++            if not self.distillation_only:
++                fields.insert(1, "rm_scores")
+             data = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=fields)
+
+             sample_uids.extend(data.pop("uid").tolist())
+             sample_outputs.extend(all_outputs[i] for i in final_indices)
+             sample_inputs.extend(all_inputs[i] for i in final_indices)
+-            scores = data["rm_scores"].sum(dim=1).tolist()
++            if "rm_scores" in data:
++                scores = data["rm_scores"].sum(dim=1).tolist()
++            else:
++                scores = [None] * len(final_indices) if self.distillation_only else [0.0] * len(final_indices)
+             sample_scores.extend(scores)
+             sample_turns.extend(data.pop("num_turns").tolist())
+-            reward_extra_infos_dict["reward"].extend(scores)
++            if not self.distillation_only:
++                reward_extra_infos_dict["reward"].extend(scores)
+
+             extra_fields_list = data.pop("extra_fields", None)
+             if extra_fields_list is not None:
+-                n_prior = len(reward_extra_infos_dict["reward"]) - len(extra_fields_list.tolist())
+-                for extra_field in extra_fields_list.tolist():
++                extra_fields_values = _normalize_tq_non_tensor_sequence(extra_fields_list)
++                n_prior = len(reward_extra_infos_dict["reward"]) - len(extra_fields_values)
++                for extra_field in extra_fields_values:
+                     reward_extra_info = (
+                         extra_field.get("reward_extra_info", {}) if isinstance(extra_field, dict) else {}
+                     )
+@@ -997,6 +1324,9 @@ class PPOTrainer(ABC):
+                         reward_extra_infos_dict[key].append(value)
+                     n_prior += 1
+
++            if self.distillation_only:
++                reward_extra_infos_dict["reward_status"].extend(["unavailable"] * len(final_indices))
++
+             reward_model = data.pop("reward_model", None)
+             if reward_model is not None:
+                 sample_gts.extend([item.get("ground_truth", None) for item in reward_model.tolist()])
+@@ -1017,7 +1347,8 @@ class PPOTrainer(ABC):
+             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+
+         # logger to wandb
+-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
++        if not self.distillation_only:
++            self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+         # dump to local dir
+         val_data_dir = self.config.trainer.get("validation_data_dir", None)
+@@ -1052,6 +1383,12 @@ class PPOTrainer(ABC):
+                 dump_path=val_data_dir,
+             )
+
++        if self.distillation_only:
++            return {
++                "val/reward/available": False,
++                "val/reward/status": "unavailable",
++                "val/samples": len(sample_scores),
++            }
+         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+
+     def _maybe_log_val_generations(self, inputs, outputs, scores):
+@@ -1104,10 +1441,22 @@ class PPOTrainer(ABC):
+                 return obj.tolist()
+             raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+-        with open(filename, "w") as f:
+-            for i in range(n):
+-                entry = {k: v[i] for k, v in base_data.items()}
+-                f.write(json.dumps(entry, ensure_ascii=False, default=json_encode_default) + "\n")
++        temporary = os.path.join(
++            dump_path,
++            f".{global_steps}.jsonl.{os.getpid()}.{uuid.uuid4().hex}.tmp",
++        )
++        try:
++            with open(temporary, "x", encoding="utf-8") as f:
++                for i in range(n):
++                    entry = {k: v[i] for k, v in base_data.items()}
++                    f.write(json.dumps(entry, ensure_ascii=False, default=json_encode_default) + "\n")
++                f.flush()
++                os.fsync(f.fileno())
++            os.replace(temporary, filename)
++            _fsync_directory(dump_path)
++        finally:
++            if os.path.exists(temporary):
++                os.unlink(temporary)
+
+         print(f"Dumped generations to {filename}")
+
+@@ -1138,33 +1487,76 @@ class PPOTrainer(ABC):
+         """Create or recreate the dump executor and futures list."""
+         self._dump_executor = ThreadPoolExecutor(max_workers=1)
+         self._dump_futures = []
++        self._dump_executor_closed = False
++
++    def _drain_dump_futures(self):
++        """Wait for every submitted dump and surface its exception."""
++        for future in self._dump_futures:
++            future.result()
++        self._dump_futures.clear()
+
+     def _shutdown_dump_executor(self):
+         """Drain pending dump futures and shut down the executor."""
+-        for f in self._dump_futures:
+-            f.result()
+-        self._dump_futures.clear()
+-        self._dump_executor.shutdown(wait=True)
++        if getattr(self, "_dump_executor_closed", False):
++            return
++        try:
++            self._drain_dump_futures()
++        finally:
++            self._dump_executor.shutdown(wait=True)
++            self._dump_executor_closed = True
+
+     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
+         """Fetch rollout data from TransferQueue and dump sorted by uid."""
+         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+-            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
++            fields = ["uid", "prompts", "responses", "reward_model", "extra_fields"]
++            if not self.distillation_only:
++                fields.insert(3, "rm_scores")
+             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+
+-            uids = data.pop("uid").tolist()
++            uids = _normalize_tq_non_tensor_sequence(data.pop("uid"))
++            if len(uids) != len(batch.keys):
++                raise ValueError(
++                    "TransferQueue uid count differs from the rollout key count: "
++                    f"{len(uids)} != {len(batch.keys)}"
++                )
+             inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
+             outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["responses"]]
+-            scores = data["rm_scores"].sum(dim=1).tolist()
++            if "rm_scores" in data:
++                scores = data.pop("rm_scores").sum(dim=1).tolist()
++            else:
++                scores = [None] * len(uids) if self.distillation_only else [0.0] * len(uids)
+
+             reward_model = data.pop("reward_model", None)
+             if reward_model is not None:
+-                gts = [item.get("ground_truth", None) for item in reward_model.tolist()]
++                reward_model_values = _normalize_tq_non_tensor_sequence(reward_model)
++                if len(reward_model_values) != len(uids):
++                    raise ValueError(
++                        "Reward-model metadata count differs from the rollout batch: "
++                        f"{len(reward_model_values)} != {len(uids)}"
++                    )
++                gts = [
++                    item.get("ground_truth", None) if isinstance(item, dict) else None
++                    for item in reward_model_values
++                ]
+             else:
+                 gts = [None] * len(uids)
+
++            extra_fields = data.pop("extra_fields", None)
++            if extra_fields is None:
++                teacher_input_evidence = [None] * len(uids)
++            else:
++                teacher_input_evidence = [
++                    item.get("teacher_input_evidence") if isinstance(item, dict) else None
++                    for item in _normalize_tq_non_tensor_sequence(extra_fields)
++                ]
++                if len(teacher_input_evidence) != len(uids):
++                    raise ValueError(
++                        "Teacher-input evidence count differs from the rollout batch: "
++                        f"{len(teacher_input_evidence)} != {len(uids)}"
++                    )
++
+             # Sort by uid key ({sample}_{rollout}_{output})
+             sort_keys = []
+             for key in batch.keys:
+@@ -1179,8 +1571,14 @@ class PPOTrainer(ABC):
+             outputs = [outputs[i] for i in sorted_indices]
+             gts = [gts[i] for i in sorted_indices]
+             scores = [scores[i] for i in sorted_indices]
++            teacher_input_evidence = [teacher_input_evidence[i] for i in sorted_indices]
+
+-            reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
++            reward_extra_infos_dict = {
++                "uid": [batch.keys[i] for i in sorted_indices],
++                "teacher_input_evidence": teacher_input_evidence,
++            }
++            if self.distillation_only:
++                reward_extra_infos_dict["reward_status"] = ["unavailable"] * len(uids)
+
+             self._dump_generations(
+                 inputs=inputs,
+@@ -1624,18 +2022,10 @@ class PPOTrainer(ABC):
+             if is_distillation_enabled(self.config.get("distillation"))
+             else False
+         )
+-        distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
+-        if is_distillation_enabled(self.config.get("distillation")):
+-            distillation_loss_cfg = self.distillation_config.distillation_loss
+-            distillation_only = (
+-                distillation_use_topk
+-                and not distillation_loss_cfg.use_task_rewards
+-                and not distillation_loss_cfg.use_policy_gradient
+-            )
+         extra_info = {
+             "calculate_entropy": calculate_entropy,
+             "distillation_use_topk": distillation_use_topk,
+-            "distillation_only": distillation_only,
++            "distillation_only": self.distillation_only,
+             "global_batch_size": ppo_mini_batch_size,
+             "mini_batch_size": ppo_mini_batch_size,
+             "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,
+@@ -1656,17 +2046,20 @@ class PPOTrainer(ABC):
+     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
+         # 1. collect necessary fields from TransferQueue for computing metrics
+         non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
+-        fields = [
+-            "prompts",
+-            "responses",
+-            "response_mask",
+-            "values",
+-            "advantages",
+-            "returns",
+-            "rm_scores",
+-            "token_level_rewards",
+-            "num_turns",
+-        ]
++        if self.distillation_only:
++            fields = ["prompts", "responses", "response_mask", "num_turns"]
++        else:
++            fields = [
++                "prompts",
++                "responses",
++                "response_mask",
++                "values",
++                "advantages",
++                "returns",
++                "rm_scores",
++                "token_level_rewards",
++                "num_turns",
++            ]
+         moe_lb_metrics_interval = self.config.actor_rollout_ref.rollout.get("moe_load_balance_metrics_interval", 0)
+         data = get_metric_data_with_optional_routed_experts(
+             keys=batch.keys,
+@@ -1705,9 +2098,10 @@ class PPOTrainer(ABC):
+                 spec_verifies = [extra_field["spec_num_verify_steps"] for extra_field in extra_fields]
+
+         data = data.to_padded_tensor()
+-        data["token_level_scores"] = data["rm_scores"]
+-        if "token_level_rewards" not in data:
+-            data["token_level_rewards"] = data["rm_scores"]
++        if not self.distillation_only:
++            data["token_level_scores"] = data["rm_scores"]
++            if "token_level_rewards" not in data:
++                data["token_level_rewards"] = data["rm_scores"]
+         data["prompt_length"] = prompt_length.float()
+         data["response_length"] = response_length.float()
+         batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num})
+@@ -1723,7 +2117,18 @@ class PPOTrainer(ABC):
+                 accumulator=self._rollout_moe_lb_metrics_accumulator,
+             )
+         )
+-        metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
++        if self.distillation_only:
++            # Pure distillation does not produce task-reward, advantage, or
++            # critic tensors. Keep those unavailable rather than fabricating
++            # zero-valued PPO metrics through the shared PPO metric helper.
++            metrics.update(
++                {
++                    "training/reward_available": False,
++                    "training/reward_status": "unavailable",
++                }
++            )
++        else:
++            metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
+         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+         n_gpus = self._get_n_gpus_for_throughput()
+         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+diff --git a/verl/trainer/sft_trainer.py b/verl/trainer/sft_trainer.py
+index 0c4aa8e0..e391a543 100644
+--- a/verl/trainer/sft_trainer.py
++++ b/verl/trainer/sft_trainer.py
+@@ -190,6 +190,15 @@ class SFTTrainer:
+         self.save_freq = self.config.trainer.save_freq
+         if self.save_freq == "after_each_epoch":
+             self.save_freq = self.steps_per_epoch
++        configured_save_steps = self.config.trainer.get("save_steps", None)
++        self.save_steps = frozenset()
++        if configured_save_steps:
++            try:
++                self.save_steps = frozenset(int(step) for step in configured_save_steps)
++            except (TypeError, ValueError) as exc:
++                raise ValueError("trainer.save_steps must contain integer steps") from exc
++            if any(step < 1 or step > self.total_training_steps for step in self.save_steps):
++                raise ValueError("trainer.save_steps must be within the configured training horizon")
+
+         self.test_freq = self.config.trainer.test_freq
+         if self.test_freq == "after_each_epoch":
+@@ -233,8 +242,12 @@ class SFTTrainer:
+         dp_rank = self.engine.get_data_parallel_rank()
+         dp_size = self.engine.get_data_parallel_size()
+
++        # Versioned datasets may pre-arrange examples into global length buckets.
++        # In that case preserving dataset order lets every DP rank receive the
++        # corresponding slice of the same bucketed global batch.
++        train_shuffle = bool(config.data.get("shuffle", True))
+         self.train_sampler = DistributedSampler(
+-            self.train_dataset, shuffle=True, num_replicas=dp_size, rank=dp_rank, drop_last=True
++            self.train_dataset, shuffle=train_shuffle, num_replicas=dp_size, rank=dp_rank, drop_last=True
+         )
+
+         self.global_batch_size = config.data.train_batch_size
+@@ -410,7 +423,9 @@ class SFTTrainer:
+
+                 is_last_step = global_step >= self.total_training_steps
+                 is_valid_step = global_step % self.test_freq == 0
+-                is_save_step = global_step % self.save_freq == 0
++                is_save_step = global_step in self.save_steps or (
++                    not self.save_steps and self.save_freq > 0 and global_step % self.save_freq == 0
++                )
+
+                 # early exit or validation step
+                 if is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step):
+@@ -437,7 +452,7 @@ class SFTTrainer:
+                         last_valid_metric = metric
+                     torch.distributed.barrier()
+
+-                if is_last_step or (self.save_freq > 0 and is_save_step):
++                if is_last_step or is_save_step:
+                     aggressive_empty_cache(force_sync=True)
+                     self.ckpt_handler.save_checkpoint(step=global_step)
+
+diff --git a/verl/utils/checkpoint/fsdp_checkpoint_manager.py b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+index 448ab201..3a168ae6 100644
+--- a/verl/utils/checkpoint/fsdp_checkpoint_manager.py
++++ b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+@@ -15,6 +15,8 @@
+ import json
+ import logging
+ import os
++import secrets
++import stat
+ import warnings
+ from dataclasses import asdict, dataclass
+ from typing import Optional
+@@ -40,6 +42,145 @@ from .checkpoint_manager import BaseCheckpointManager
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
++_VISUAL_PROCESSOR_METADATA_FILENAMES = (
++    "preprocessor_config.json",
++    "video_preprocessor_config.json",
++)
++
++
++def _copy_optional_visual_processor_metadata(source_model_path: str, target_hf_path: str) -> tuple[str, ...]:
++    """Durably copy optional visual processor metadata into an HF checkpoint.
++
++    ``ProcessorMixin.save_pretrained`` does not always reproduce every visual
++    metadata file shipped with a model.  These two files are model assets, so
++    copy them byte-for-byte from the local model directory when present.  A
++    missing source remains optional for compatibility with text-only models.
++
++    Both source and destination entries are handled without following file
++    symlinks.  Writes go to a new file in the destination directory, are
++    fsynced, and are then atomically installed.  The destination directory is
++    fsynced as well so that a successful checkpoint save cannot advertise the
++    file before its directory entry is durable.
++    """
++
++    source_model_path = os.fspath(source_model_path)
++    target_hf_path = os.fspath(target_hf_path)
++
++    try:
++        target_dir_stat = os.lstat(target_hf_path)
++    except FileNotFoundError as exc:
++        raise ValueError(f"Visual metadata target directory does not exist: {target_hf_path}") from exc
++    if stat.S_ISLNK(target_dir_stat.st_mode) or not stat.S_ISDIR(target_dir_stat.st_mode):
++        raise ValueError(f"Visual metadata target must be a non-symlink directory: {target_hf_path}")
++
++    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
++    target_dir_fd = os.open(target_hf_path, directory_flags)
++    copied: list[str] = []
++    try:
++        opened_target_dir_stat = os.fstat(target_dir_fd)
++        if (opened_target_dir_stat.st_dev, opened_target_dir_stat.st_ino) != (
++            target_dir_stat.st_dev,
++            target_dir_stat.st_ino,
++        ):
++            raise RuntimeError(f"Visual metadata target directory changed while opening: {target_hf_path}")
++
++        for filename in _VISUAL_PROCESSOR_METADATA_FILENAMES:
++            source_path = os.path.join(source_model_path, filename)
++            try:
++                source_lstat = os.lstat(source_path)
++            except FileNotFoundError:
++                continue
++            if stat.S_ISLNK(source_lstat.st_mode) or not stat.S_ISREG(source_lstat.st_mode):
++                raise ValueError(f"Visual metadata source must be a regular non-symlink file: {source_path}")
++
++            source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
++            source_fd = os.open(source_path, source_flags)
++            temp_name = None
++            temp_fd = None
++            try:
++                opened_source_stat = os.fstat(source_fd)
++                if not stat.S_ISREG(opened_source_stat.st_mode) or (
++                    opened_source_stat.st_dev,
++                    opened_source_stat.st_ino,
++                ) != (source_lstat.st_dev, source_lstat.st_ino):
++                    raise RuntimeError(f"Visual metadata source changed while opening: {source_path}")
++
++                try:
++                    target_lstat = os.stat(filename, dir_fd=target_dir_fd, follow_symlinks=False)
++                except FileNotFoundError:
++                    target_lstat = None
++                if target_lstat is not None and (
++                    stat.S_ISLNK(target_lstat.st_mode) or not stat.S_ISREG(target_lstat.st_mode)
++                ):
++                    raise ValueError(
++                        f"Visual metadata target must be absent or a regular non-symlink file: "
++                        f"{os.path.join(target_hf_path, filename)}"
++                    )
++
++                for _ in range(128):
++                    candidate = f".{filename}.{secrets.token_hex(8)}.tmp"
++                    try:
++                        temp_fd = os.open(
++                            candidate,
++                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
++                            0o600,
++                            dir_fd=target_dir_fd,
++                        )
++                        temp_name = candidate
++                        break
++                    except FileExistsError:
++                        continue
++                if temp_fd is None or temp_name is None:
++                    raise FileExistsError(f"Unable to allocate a visual metadata temporary file for {filename}")
++
++                while True:
++                    chunk = os.read(source_fd, 1024 * 1024)
++                    if not chunk:
++                        break
++                    view = memoryview(chunk)
++                    while view:
++                        written = os.write(temp_fd, view)
++                        if written <= 0:
++                            raise OSError(f"Short write while copying visual metadata: {source_path}")
++                        view = view[written:]
++                os.fchmod(temp_fd, 0o644)
++                os.fsync(temp_fd)
++                os.close(temp_fd)
++                temp_fd = None
++
++                # Recheck immediately before the atomic replacement.  Even if
++                # an entry is swapped after this check, os.replace replaces the
++                # directory entry itself and never follows a symlink target.
++                try:
++                    target_lstat = os.stat(filename, dir_fd=target_dir_fd, follow_symlinks=False)
++                except FileNotFoundError:
++                    target_lstat = None
++                if target_lstat is not None and (
++                    stat.S_ISLNK(target_lstat.st_mode) or not stat.S_ISREG(target_lstat.st_mode)
++                ):
++                    raise ValueError(
++                        f"Visual metadata target must be absent or a regular non-symlink file: "
++                        f"{os.path.join(target_hf_path, filename)}"
++                    )
++
++                os.replace(temp_name, filename, src_dir_fd=target_dir_fd, dst_dir_fd=target_dir_fd)
++                temp_name = None
++                os.fsync(target_dir_fd)
++                copied.append(filename)
++            finally:
++                os.close(source_fd)
++                if temp_fd is not None:
++                    os.close(temp_fd)
++                if temp_name is not None:
++                    try:
++                        os.unlink(temp_name, dir_fd=target_dir_fd)
++                    except FileNotFoundError:
++                        pass
++    finally:
++        os.close(target_dir_fd)
++
++    return tuple(copied)
++
+
+ @dataclass
+ class FSDPConfig:
+@@ -338,12 +479,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+             hf_config_tokenizer_path = os.path.join(local_path, "huggingface")
+             local_mkdir_safe(hf_config_tokenizer_path)
+             model_config = unwrap_model.config
++            source_model_path = getattr(model_config, "name_or_path", None)
+             generation_config = None
+-            if unwrap_model.can_generate() and hasattr(model_config, "name_or_path") and model_config.name_or_path:
++            if unwrap_model.can_generate() and source_model_path:
+                 try:
+                     # Some model's name_or_path is empty if not initialized from pretrained,
+                     # in this cases, we don't save generation config.
+-                    generation_config = GenerationConfig.from_pretrained(model_config.name_or_path)
++                    generation_config = GenerationConfig.from_pretrained(source_model_path)
+                     generation_config.save_pretrained(hf_config_tokenizer_path)
+                 except Exception:
+                     # if the generation config isn't available, we don't save it
+@@ -355,12 +497,25 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+             model_config.save_pretrained(hf_config_tokenizer_path)
+             if self.processing_class is not None:
+                 self.processing_class.save_pretrained(hf_config_tokenizer_path)
++            copied_visual_metadata = ()
++            if source_model_path:
++                copied_visual_metadata = _copy_optional_visual_processor_metadata(
++                    source_model_path, hf_config_tokenizer_path
++                )
+             log_with_rank(
+                 f"Saved model config and tokenizer class to {os.path.abspath(hf_config_tokenizer_path)}",
+                 rank=self.rank,
+                 logger=logger,
+                 log_only_rank_0=True,
+             )
++            if copied_visual_metadata:
++                log_with_rank(
++                    f"Copied visual processor metadata to {os.path.abspath(hf_config_tokenizer_path)}: "
++                    f"{', '.join(copied_visual_metadata)}",
++                    rank=self.rank,
++                    logger=logger,
++                    log_only_rank_0=True,
++                )
+
+             # If we have a custom model, we copy the file defining it in the folder and set the attributes so it can be
+             # loaded from the Hub.
+@@ -420,7 +575,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+
+                 drop_tied_target_keys(state_dict, save_model, model_config)
+
+-                save_model.save_pretrained(hf_local_path, state_dict=state_dict)
++                # ``state_dict`` comes directly from the current FSDP model and
++                # therefore already uses current Transformers parameter names.
++                # Do not let Transformers 5.x apply its legacy reverse mapping;
++                # Qwen3.5 otherwise receives duplicated language-model prefixes
++                # and the exported checkpoint is unloadable by vLLM.
++                save_model.save_pretrained(
++                    hf_local_path,
++                    state_dict=state_dict,
++                    save_original_format=False,
++                )
+                 log_with_rank(
+                     f"Saved hf_model to {os.path.abspath(hf_local_path)}",
+                     rank=self.rank,
+diff --git a/verl/utils/tensordict_utils.py b/verl/utils/tensordict_utils.py
+index 91d82b15..ac8e274e 100644
+--- a/verl/utils/tensordict_utils.py
++++ b/verl/utils/tensordict_utils.py
+@@ -357,12 +357,14 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
+             padded_chunks = padded.chunk(chunks, dim=0)
+             offsets = nt.offsets()
+             lengths = offsets.diff().tolist()
++            ragged_idx = getattr(nt, "_ragged_idx", nt.dim() - 1)
++            sample_ragged_dim = ragged_idx - 1
+             for i, chunk_td in enumerate(tds):
+                 chunk_lengths = lengths[i * chunk_size : (i + 1) * chunk_size]
+-                chunk_tensors = [padded_chunks[i][j, :seq_len] for j, seq_len in enumerate(chunk_lengths)]
+-                chunk_td[key] = nested_tensor_from_tensor_list(
+-                    chunk_tensors, ragged_idx=getattr(nt, "_ragged_idx", nt.dim() - 1)
+-                )
++                chunk_tensors = [
++                    padded_chunks[i][j].narrow(sample_ragged_dim, 0, seq_len) for j, seq_len in enumerate(chunk_lengths)
++                ]
++                chunk_td[key] = nested_tensor_from_tensor_list(chunk_tensors, ragged_idx=ragged_idx)
+             continue
+
+         for i, chunk_td in enumerate(tds):
+@@ -908,11 +910,98 @@ def contiguous(data: TensorDict) -> TensorDict:
+
+
+ def maybe_fix_3d_position_ids(data: TensorDict):
+-    # note for tensordict with pickle/unpickle. nested tensor in tensordict after consolidate and pickle/unpickle
+-    # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
+-    # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
+-    if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
+-        data["position_ids"]._ragged_idx = 2
++    """Restore the sequence-ragged layout of multimodal position IDs.
++
++    TensorDict/TransferQueue reconstruction can infer the wrong ragged axis
++    for a batch of per-sample ``[rope_axes, seq_len]`` tensors, especially
++    when a data-parallel shard contains only one sample.  Such a tensor has
++    physical values ``[rope_axes, seq_len]`` but offsets ``[0, rope_axes]``.
++    Merely changing its private ``_ragged_idx`` to 2 makes the metadata
++    internally inconsistent; the next micro-batch split then truncates the
++    sequence to ``rope_axes`` tokens.
++
++    ``input_ids`` has an unambiguous one-dimensional jagged layout, so use its
++    offsets as the canonical per-sample sequence boundaries and rebuild the
++    position NestedTensor.  The fallback retains the old metadata-only repair
++    for callers that do not carry nested ``input_ids``.
++    """
++    if "position_ids" not in data.keys():
++        return
++
++    position_ids = data["position_ids"]
++    if not position_ids.is_nested or position_ids.dim() != 3:
++        return
++
++    input_ids = data.get("input_ids")
++    if not isinstance(input_ids, torch.Tensor) or not input_ids.is_nested:
++        position_ids._ragged_idx = 2
++        return
++
++    target_offsets = input_ids.offsets()
++    if torch.equal(position_ids.offsets(), target_offsets):
++        position_ids._ragged_idx = 2
++        return
++
++    target_lengths = target_offsets.diff().tolist()
++    total_tokens = int(target_offsets[-1].item())
++    axis_major_values = None
++
++    # Fast path for TransferQueue reconstruction.  Its inferred ragged axis
++    # can be wrong, but unbind still returns the original per-sample tensors.
++    try:
++        pieces = position_ids.unbind(dim=0)
++    except RuntimeError:
++        pieces = ()
++
++    if len(pieces) == len(target_lengths):
++        normalized_pieces = []
++        num_rope_axes = None
++        for piece, seq_len in zip(pieces, target_lengths, strict=True):
++            if piece.ndim != 2:
++                normalized_pieces = []
++                break
++            if piece.shape[-1] == seq_len:
++                normalized = piece
++            elif piece.shape[0] == seq_len:
++                normalized = piece.transpose(0, 1).contiguous()
++            else:
++                normalized_pieces = []
++                break
++            if num_rope_axes is None:
++                num_rope_axes = normalized.shape[0]
++            elif normalized.shape[0] != num_rope_axes:
++                normalized_pieces = []
++                break
++            normalized_pieces.append(normalized)
++        if normalized_pieces:
++            axis_major_values = torch.cat(normalized_pieces, dim=1)
++
++    # Consolidate/pickle can instead leave valid physical values while making
++    # unbind fail.  Recover directly by matching the canonical token count.
++    if axis_major_values is None:
++        values = position_ids.values()
++        if values.ndim == 2 and values.shape[1] == total_tokens:
++            axis_major_values = values
++        elif values.ndim == 2 and values.shape[0] == total_tokens:
++            axis_major_values = values.transpose(0, 1).contiguous()
++        else:
++            raise ValueError(
++                "Cannot align multimodal position IDs with input tokens: "
++                f"position_values_shape={tuple(values.shape)}, "
++                f"position_offsets={position_ids.offsets().tolist()}, "
++                f"input_offsets={target_offsets.tolist()}"
++            )
++
++    if axis_major_values.shape[0] not in (3, 4) or axis_major_values.shape[1] != total_tokens:
++        raise ValueError(
++            "Expected 3 or 4 position axes aligned to every input token, "
++            f"got position_values_shape={tuple(axis_major_values.shape)}, total_tokens={total_tokens}"
++        )
++
++    repaired = torch.nested.nested_tensor_from_jagged(values=axis_major_values, offsets=target_offsets)
++    repaired._ragged_idx = 2
++    with data.unlock_():
++        data["position_ids"] = repaired
+
+
+ def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDict:
+diff --git a/verl/utils/tracking.py b/verl/utils/tracking.py
+index e7c9ff27..4facdf18 100644
+--- a/verl/utils/tracking.py
++++ b/verl/utils/tracking.py
+@@ -22,6 +22,7 @@ import os
+ from contextlib import contextmanager
+ from enum import Enum
+ from functools import partial
++from numbers import Number
+ from pathlib import Path
+ from typing import Any
+
+@@ -58,6 +59,10 @@ class Tracking:
+     ]
+
+     def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
++        # Initialize lifecycle state before importing any optional backend so a
++        # partially constructed Tracking object is still safe to finalize.
++        self.logger = {}
++        self._finished = False
+         if isinstance(default_backend, str):
+             default_backend = [default_backend]
+         for backend in default_backend:
+@@ -67,9 +72,6 @@ class Tracking:
+                 warnings.warn("`tracking` logger is deprecated. use `wandb` instead.", DeprecationWarning, stacklevel=2)
+             else:
+                 assert backend in self.supported_backend, f"{backend} is not supported"
+-
+-        self.logger = {}
+-
+         if "tracking" in default_backend or "wandb" in default_backend:
+             import os
+
+@@ -186,27 +188,68 @@ class Tracking:
+             self.logger["rl_insight"] = RLInsightLogger(project_name, experiment_name, config)
+
+     def log(self, data, step, backend=None):
++        if self._finished:
++            raise RuntimeError("Cannot log through a finished Tracking instance")
+         for default_backend, logger_instance in self.logger.items():
+             if backend is None or default_backend in backend:
+                 logger_instance.log(data=data, step=step)
+
+-    def __del__(self):
++    def flush(self):
++        """Synchronously flush backends which expose an explicit flush hook."""
++        if self._finished:
++            return
++        for logger_instance in self.logger.values():
++            flush = getattr(logger_instance, "flush", None)
++            if callable(flush):
++                flush()
++
++    def finish(self):
++        """Finish every backend exactly once.
++
++        Training code calls this before publishing its final checkpoint.  The
++        destructor remains only a best-effort fallback and is no longer the
++        durability boundary for TensorBoard.
++        """
++        if getattr(self, "_finished", True):
++            return
++        self._finished = True
++        errors = []
++
++        def call(backend, method="finish", **kwargs):
++            instance = self.logger.get(backend)
++            if instance is None:
++                return
++            try:
++                getattr(instance, method)(**kwargs)
++            except Exception as exc:  # finish all backends before surfacing one failure
++                errors.append(exc)
++
+         if "wandb" in self.logger:
+-            self.logger["wandb"].finish(exit_code=0)
++            call("wandb", exit_code=0)
+         if "swanlab" in self.logger:
+-            self.logger["swanlab"].finish()
++            call("swanlab")
+         if "vemlp_wandb" in self.logger:
+-            self.logger["vemlp_wandb"].finish(exit_code=0)
++            call("vemlp_wandb", exit_code=0)
+         if "tensorboard" in self.logger:
+-            self.logger["tensorboard"].finish()
++            call("tensorboard")
+         if "clearml" in self.logger:
+-            self.logger["clearml"].finish()
++            call("clearml")
+         if "trackio" in self.logger:
+-            self.logger["trackio"].finish()
++            call("trackio")
+         if "file" in self.logger:
+-            self.logger["file"].finish()
++            call("file")
+         if "rl_insight" in self.logger:
+-            self.logger["rl_insight"].finish()
++            call("rl_insight")
++        if errors:
++            raise errors[0]
++
++    def __del__(self):
++        try:
++            self.finish()
++        except Exception:
++            # Exceptions raised from __del__ are unraisable and obscure the
++            # original failure. Explicit training-path finish() still raises.
++            pass
+
+
+ class RLInsightLogger:
+@@ -437,13 +480,47 @@ class _TensorboardAdapter:
+         os.makedirs(tensorboard_dir, exist_ok=True)
+         print(f"Saving tensorboard log to {tensorboard_dir}.")
+         self.writer = SummaryWriter(tensorboard_dir)
++        self._finished = False
+
+     def log(self, data, step):
+-        for key in data:
+-            self.writer.add_scalar(key, data[key], step)
++        if self._finished:
++            raise RuntimeError("Cannot write to a finished TensorBoard adapter")
++        for key, value in data.items():
++            # TensorBoard's scalar API rejects explicit status metadata such
++            # as ``"unavailable"``. Preserve that information as text while
++            # keeping measured numeric metrics on the scalar timeline.
++            if isinstance(value, str):
++                self.writer.add_text(key, value, step)
++                continue
++            if isinstance(value, Number):
++                self.writer.add_scalar(key, value, step)
++                continue
++
++            # TensorBoard accepts one-element tensors/arrays, but not
++            # structured metadata or multi-element values. Check those two
++            # common scalar containers without importing an optional array
++            # framework solely for logging.
++            numel = getattr(value, "numel", None)
++            if callable(numel):
++                try:
++                    if numel() == 1:
++                        self.writer.add_scalar(key, value, step)
++                except (TypeError, ValueError):
++                    pass
++                continue
++            size = getattr(value, "size", None)
++            if isinstance(size, Number) and size == 1:
++                self.writer.add_scalar(key, value, step)
++
++    def flush(self):
++        if not self._finished:
++            self.writer.flush()
+
+     def finish(self):
+-        self.writer.close()
++        if not self._finished:
++            self.writer.flush()
++            self.writer.close()
++            self._finished = True
+
+
+ class _MlflowLoggingAdapter:
+diff --git a/verl/workers/config/distillation.py b/verl/workers/config/distillation.py
+index b58f8bcc..e6ec326e 100644
+--- a/verl/workers/config/distillation.py
++++ b/verl/workers/config/distillation.py
+@@ -233,6 +233,15 @@ class DistillationConfig(BaseConfig):
+     teacher_key (str):
+         Key to route examples to the appropriate teacher model in multi-teacher setups. Should correspond to a field in
+         the data proto, e.g., data_source.
++    teacher_image_key (str, optional):
++        Dataset column containing privileged teacher-side images.  When set,
++        the teacher prompt is rebuilt with these images before log-probability
++        inference; reusing the student's multimodal prompt IDs is invalid when
++        the replacement image has a different visual-token grid.
++    fallback_to_student_images (bool):
++        Allow rows with an empty ``teacher_image_key`` value to use the
++        student's original images.  Missing privileged inputs fail closed when
++        this is false.
+     distillation_loss (DistillationLossConfig):
+     Configuration for distillation loss settings.
+
+@@ -264,9 +273,22 @@ class DistillationConfig(BaseConfig):
+     nnodes: int = 0
+     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
+     teacher_key: str = "data_source"
++    teacher_image_key: Optional[str] = None
++    fallback_to_student_images: bool = False
+     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
+
+     def __post_init__(self):
++        if self.teacher_image_key is not None:
++            if (
++                not isinstance(self.teacher_image_key, str)
++                or not self.teacher_image_key
++                or self.teacher_image_key != self.teacher_image_key.strip()
++            ):
++                raise ValueError("teacher_image_key must be a non-empty, whitespace-trimmed string when set.")
++        if not isinstance(self.fallback_to_student_images, bool):
++            raise TypeError("fallback_to_student_images must be a boolean.")
++        if self.fallback_to_student_images and self.teacher_image_key is None:
++            raise ValueError("fallback_to_student_images requires teacher_image_key to be set.")
+         if not self.enabled:
+             return
+
+diff --git a/verl/workers/engine/automodel/transformer_impl.py b/verl/workers/engine/automodel/transformer_impl.py
+index dc917176..2a00583b 100644
+--- a/verl/workers/engine/automodel/transformer_impl.py
++++ b/verl/workers/engine/automodel/transformer_impl.py
+@@ -47,6 +47,7 @@ from verl.utils.device import get_device_id, get_device_name
+ from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
+ from verl.utils.torch_functional import logprobs_from_logits
+ from verl.workers.config import AutomodelEngineConfig, AutomodelOptimizerConfig, HFModelConfig
++from verl.workers.utils.padding import pack_position_ids
+
+ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
+ from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
+@@ -504,10 +505,7 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
+
+             if pad_mode == DatasetPadMode.NO_PADDING:
+                 input_ids_rmpad = input_ids.values().unsqueeze(0)
+-                if position_ids.dim() == 3:
+-                    position_ids_rmpad = position_ids.values().unsqueeze(1)
+-                else:
+-                    position_ids_rmpad = position_ids.values().unsqueeze(0)
++                position_ids_rmpad = pack_position_ids(position_ids, total_tokens=input_ids_rmpad.shape[-1])
+             else:
+                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index fa06a85a..ae278426 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -71,7 +71,7 @@ from verl.utils.ulysses import (
+     ulysses_pad_and_slice_inputs,
+ )
+ from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
+-from verl.workers.utils.padding import build_attention_mask_from_nested
++from verl.workers.utils.padding import build_attention_mask_from_nested, pack_position_ids
+
+ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
+ from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
+@@ -1097,10 +1097,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
+             if pad_mode == DatasetPadMode.NO_PADDING:
+                 input_ids_rmpad = input_ids.values().unsqueeze(0)  # (1, total_nnz)
+                 packed_cu_seqlens = input_ids.offsets().to(device=input_ids_rmpad.device, dtype=torch.long)
+-                if position_ids.dim() == 3:
+-                    position_ids_rmpad = position_ids.values().unsqueeze(1)  # (4, 1, total_nnz)
+-                else:
+-                    position_ids_rmpad = position_ids.values().unsqueeze(0)  # (1, total_nnz)
++                position_ids_rmpad = pack_position_ids(position_ids, total_tokens=input_ids_rmpad.shape[-1])
+             else:
+                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+
+diff --git a/verl/workers/rollout/replica.py b/verl/workers/rollout/replica.py
+index 22bb8667..72ea1edd 100644
+--- a/verl/workers/rollout/replica.py
++++ b/verl/workers/rollout/replica.py
+@@ -157,13 +157,8 @@ class RolloutReplica(ABC):
+         await self.launch_servers()
+
+     # TODO(sgm): this should be the default solution, but need to make the RolloutMode more clear.
+-    async def init_colocated(self, resource_pool: RayResourcePool):
+-        """Init colocated rollout server, rollout engine and hybrid engine colocated in same ray placement group
+-        but in separate processes.
+-
+-        Args:
+-            resource_pool: RayResourcePool, ray placement group where hybrid engine processes have been launched.
+-        """
++    async def prepare_colocated(self, resource_pool: RayResourcePool):
++        """Create colocated rollout workers without starting the model server."""
+         self.rollout_mode = RolloutMode.COLOCATED
+         self.resource_pool = resource_pool
+         use_gpu = self.rollout_worker_use_gpu()
+@@ -184,6 +179,10 @@ class RolloutReplica(ABC):
+             device_name=get_device_name(),
+         )
+         self.workers = worker_group.workers
++
++    async def init_colocated(self, resource_pool: RayResourcePool):
++        """Init colocated rollout workers and then start their model server."""
++        await self.prepare_colocated(resource_pool)
+         await self.launch_servers()
+
+     async def init_standalone(self):
+diff --git a/verl/workers/utils/padding.py b/verl/workers/utils/padding.py
+index ed8d1455..ccc93a70 100644
+--- a/verl/workers/utils/padding.py
++++ b/verl/workers/utils/padding.py
+@@ -20,6 +20,61 @@ from verl.utils import tensordict_utils as tu
+ from verl.utils.attention_utils import index_first_axis, unpad_input
+
+
++def pack_position_ids(position_ids: torch.Tensor, total_tokens: int) -> torch.Tensor:
++    """Pack jagged position IDs without relying on NestedTensor shape metadata.
++
++    ``TensorDict.consolidate`` followed by serialization can lose the ragged
++    dimension metadata of a 3D NestedTensor.  In that case a multimodal
++    position tensor whose physical values are ``[num_rope_axes, total_tokens]``
++    may be reported with a different logical dimension.  Branching on
++    ``position_ids.dim()`` can consequently turn token-major values
++    ``[total_tokens, num_rope_axes]`` into ``[1, total_tokens, num_rope_axes]``.
++    Qwen-style M-RoPE models instead require axis-major packed position IDs:
++    ``[num_rope_axes, 1, total_tokens]``.
++
++    The physical values and the independently known token count are stable
++    across serialization, so use them to identify and normalize the layout.
++    Standard 1D position IDs are returned as ``[1, total_tokens]``.
++    """
++    if not position_ids.is_nested:
++        raise ValueError("pack_position_ids expects a jagged NestedTensor")
++    if not isinstance(total_tokens, int) or total_tokens <= 0:
++        raise ValueError(f"total_tokens must be a positive int, got {total_tokens!r}")
++
++    values = position_ids.values()
++    if values.ndim == 1:
++        if values.shape[0] != total_tokens:
++            raise ValueError(
++                "1D packed position IDs do not match input token count: "
++                f"values_shape={tuple(values.shape)}, total_tokens={total_tokens}"
++            )
++        return values.unsqueeze(0)
++
++    if values.ndim != 2:
++        raise ValueError(
++            "Packed position IDs must have physical values with one or two dimensions, "
++            f"got values_shape={tuple(values.shape)}"
++        )
++
++    if values.shape[1] == total_tokens:
++        axis_major_values = values
++    elif values.shape[0] == total_tokens:
++        axis_major_values = values.transpose(0, 1).contiguous()
++    else:
++        raise ValueError(
++            "Multimodal packed position IDs do not match input token count: "
++            f"values_shape={tuple(values.shape)}, total_tokens={total_tokens}"
++        )
++
++    num_rope_axes = axis_major_values.shape[0]
++    if num_rope_axes not in (3, 4):
++        raise ValueError(
++            "Expected 3 or 4 M-RoPE position axes after packing, "
++            f"got {num_rope_axes} from values_shape={tuple(values.shape)}"
++        )
++    return axis_major_values.unsqueeze(1)
++
++
+ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
+     """
+     Convert TensorDict from left-right padding to no-padding format.

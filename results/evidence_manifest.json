@@ -1,0 +1,42 @@
+{
+  "schema_version": "hw_bjtu_opd_result_evidence_manifest_v1",
+  "aggregate_only": true,
+  "sample_level_data_included": false,
+  "authorities": [
+    {
+      "logical_name": "required_fourbench_matrix_20260815_v1",
+      "sha256": "f5bc6b7d486e5be23e44cc99a7ced4e44a313b287314afef373390fb51dd7ede",
+      "covers": ["raw Qwen3.5-9B", "local Vision-OPD-9B", "BLINK-exact protocol"]
+    },
+    {
+      "logical_name": "requested_sft_matrix_fourbench_results_v1",
+      "sha256": "27c64723f5f2958bb5cb580053f35d1762d1470db9709fedc18ddba172321cd5",
+      "covers": ["raw Qwen3.5-27B", "Qwen3.5-9B SFT_V1 10K", "Qwen3.5-27B SFT_V1 10K"]
+    },
+    {
+      "logical_name": "b57_full8_fourbench_raw9_teacher_v1",
+      "sha256": "4210dadca4a7201e8000eaf9663a14036e8ccc7e8753ce43293ea8cd51b4f765",
+      "covers": ["9B SFT student + Vision6K crop + raw 9B teacher"]
+    },
+    {
+      "logical_name": "b57_full8_fourbench_b57_9b_teacher_v1",
+      "sha256": "d0f3b23f295ddf4ae3175f8d89b6826f851f3d1b0b5bc764f5396b2456aa46b1",
+      "covers": ["9B SFT student + Vision6K crop + 9B SFT teacher"]
+    },
+    {
+      "logical_name": "b57_full8_fourbench_b57_27b_teacher_v1",
+      "sha256": "6d2dcf6bd4b2d550f27e3aa0b36a20822cfa9e3fb979d231343bb095c087eab8",
+      "covers": ["9B SFT student + Vision6K crop + 27B SFT teacher"]
+    },
+    {
+      "logical_name": "official_vision_opd_9b_vstar_aggregate",
+      "sha256": "ddb14bb071d4654cd333b5c8e23e789a3f8529ec8c4ac8faf16f5c2b2eb258aa",
+      "covers": ["Vision-OPD-9B official recovered VStar"]
+    },
+    {
+      "logical_name": "official_vision_opd_9b_vstar_recovery_receipt",
+      "sha256": "1f82b7246fd704157cfd1b40e5b053631c50f4597725e4d54df507322b15a8ef",
+      "covers": ["Vision-OPD-9B recovery provenance"]
+    }
+  ]
+}
