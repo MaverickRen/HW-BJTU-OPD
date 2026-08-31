@@ -1,63 +1,122 @@
 # HW-BJTU-OPD
 
-Qwen3.5 multimodal SFT, crop-based online perception distillation (OPD), checkpoint export and frozen four-benchmark evaluation.
+Reproducible Qwen3.5 multimodal SFT and crop-based online perception
+distillation (OPD), with public checkpoints, pinned data, and a simple
+aggregate-only evaluation entry.
 
-The latest completed experiment is exactly:
+## Public release
 
-- **Student initialization:** Qwen3.5-9B after one epoch of SFT_V1 10K.
-- **OPD data:** decontaminated Vision-OPD-6K, 6,241 rows.
-- **Student view:** full image with the target region marked by a red box.
-- **Teacher view:** the actual cropped target region.
-- **Teacher:** Qwen3.5-27B after the same SFT_V1 10K, fixed (`teacher_update_rate=0`).
-- **Run:** 8 GPUs, batch 96, rollout `n=8`, 65 steps, seed 42.
+The newly released model is the requested **second-highest macro** experiment:
 
-It reaches **93.72 V***, **76.20 MMStar**, **66.02 BLINK-v5**, **63.55 ZoomBench**, and **74.87 four-benchmark macro**. This is the strongest macro result in the current controlled matrix.
+- Student: Qwen3.5-9B after SFT_V1 10K.
+- Teacher: the same Qwen3.5-9B SFT_V1 10K checkpoint, fixed throughout OPD.
+- Data: 6,241 rows from pinned Vision-OPD-6K.
+- Views: red-box full image for the student; actual target crop for the teacher.
+- Run: eight GPUs, batch 96, rollout `n=8`, 65 steps, seed 42.
 
-## Repository contents
+Published artifacts:
 
-```text
-configs/                 exact SFT and OPD configurations
-scripts/                 portable data/train/export/evaluation entrypoints
-src/hw_bjtu_opd/data/    relative-path-aware multimodal SFT adapter
-repro/                   source-frozen launchers, mergers and evaluators
-patches/                 veRL Qwen3.5/OPD patch and its CPU contract tests
-results/                 machine-readable aggregate results
-docs/                    data, protocol and reproducibility notes
-hf_card/                 public Hugging Face release card
+- **Final OPD model:**
+  [`HWBJTUOPD/Qwen3.5-9B-SFT10K-VisionOPD6K-SFT9BTeacher`](https://huggingface.co/HWBJTUOPD/Qwen3.5-9B-SFT10K-VisionOPD6K-SFT9BTeacher)
+- **SFT checkpoints and portable SFT_V1 10K data:**
+  [`HWBJTUOPD/HW-BJTU-OPD`](https://huggingface.co/HWBJTUOPD/HW-BJTU-OPD)
+- **Source:**
+  [`MaverickRen/HW-BJTU-OPD`](https://github.com/MaverickRen/HW-BJTU-OPD)
+
+The final OPD model is a closed seven-file Hugging Face artifact. Its
+`model.safetensors` is 18,819,722,392 bytes with SHA256
+`c86054edddaf186b5a0754fed55e4d8e80108ba2081ff7e6ba7c2d3e589ccdc7`.
+
+## Fastest result reproduction
+
+This is the supported, low-cost public gate. It downloads the exact model and
+the pinned 191-row VStar snapshot, verifies all model/data hashes, runs a
+loopback-only vLLM service, and persists aggregate counts only.
+
+```bash
+git clone https://github.com/MaverickRen/HW-BJTU-OPD.git
+cd HW-BJTU-OPD
+
+python3.12 -m venv .venv
+source .venv/bin/activate
+scripts/install_eval.sh
+
+scripts/evaluate_vstar.sh --execute
 ```
 
-Large datasets, checkpoints, benchmark payloads, predictions, caches and credentials are deliberately excluded from Git. The companion public artifact repository is:
+Use the installer rather than invoking `pip install -r requirements-eval.txt`
+directly. vLLM 0.18 declares `transformers<5`, while its audited Qwen3.5
+runtime here uses Transformers 5.5; the script resolves vLLM first and applies
+that tested override explicitly. It also pins the QuACK/CUTLASS DSL pair whose
+unbounded upstream upgrade otherwise fails during vLLM worker initialization.
 
-```text
-HWBJTUOPD/HW-BJTU-OPD
+The default uses one CUDA GPU; at least 48 GB of GPU memory is recommended.
+The model download is about 18.84 GB. Allow at least 45 GB of free disk during
+the first install and download; the installer does not retain the large wheel
+cache. For the historical tensor-parallel topology, use:
+
+```bash
+scripts/evaluate_vstar.sh \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --tp-size 8 \
+  --execute
 ```
 
-It contains the portable SFT_V1 10K snapshot and the merged 9B/27B SFT checkpoints in subdirectories.
+Expected VStar result: **176/191 = 92.1466%**. The script marks results within
+three correct answers as similar because changing GPU topology or kernels can
+change a few greedy outputs. `--quick 8` is available to check plumbing, but
+it is not a result reproduction. Omitting `--execute` prints a no-write plan.
+
+A fresh install on 2026-08-31 reproduced **176/191** with TP4 on four NVIDIA
+L20C GPUs. The aggregate-only, path-free environment and result receipt is
+[`results/vstar_reproduction_validation.json`](results/vstar_reproduction_validation.json).
+
+The exact historical run used TP8 and the versions in
+[`requirements-eval.txt`](requirements-eval.txt). This environment has been
+separated from the larger training environment to keep installation small.
 
 ## Results
 
-All values are percentages; counts and full protocol metadata are in [`results/core_results.json`](results/core_results.json).
+All values below are percentages. Exact counts and protocol IDs are in
+[`results/core_results.json`](results/core_results.json); the released row also
+has a sanitized, aggregate-only receipt in
+[`results/released_opd9_teacher.json`](results/released_opd9_teacher.json).
 
-| Model / experiment | V* | MMStar | BLINK-v5 | ZoomBench | Macro |
+| Model / experiment | VStar | MMStar | BLINK-v5 | ZoomBench | Macro |
 |---|---:|---:|---:|---:|---:|
 | Qwen3.5-9B raw | 84.82 | 78.93 | 59.13 | 51.01 | 68.47 |
 | Qwen3.5-27B raw | 86.39 | 79.33 | 50.97 | 57.63 | 68.58 |
 | Qwen3.5-9B SFT_V1 10K | 85.86 | 77.47 | 64.97 | 52.90 | 70.30 |
 | Qwen3.5-27B SFT_V1 10K | 86.39 | 79.87 | 62.65 | 58.70 | 71.90 |
-| 9B SFT + Vision6K Crop + raw 9B teacher | 92.67 | 76.20 | 64.18 | 61.07 | 73.53 |
-| 9B SFT + Vision6K Crop + 9B SFT teacher | 92.15 | **77.27** | **66.44** | 62.13 | 74.50 |
-| 9B SFT + Vision6K Crop + 27B SFT teacher | **93.72** | 76.20 | 66.02 | **63.55** | **74.87** |
+| 9B SFT + Vision6K crop + raw 9B teacher | 92.67 | 76.20 | 64.18 | 61.07 | 73.53 |
+| **9B SFT + Vision6K crop + 9B SFT teacher (released)** | **92.15** | **77.27** | **66.44** | **62.13** | **74.50** |
+| 9B SFT + Vision6K crop + 27B SFT teacher | 93.72 | 76.20 | 66.02 | 63.55 | 74.87 |
 
-Vision-OPD reference checkpoints are reported separately because the available local record uses another BLINK protocol:
+The released row is second by macro and has the strongest MMStar and BLINK-v5
+cells among the three OPD arms. `BLINK-v5` is a frozen local checkpoint
+comparison protocol, not an official BLINK leaderboard result. See
+[`docs/RESULTS.md`](docs/RESULTS.md) before comparing BLINK variants.
 
-- Official Vision-OPD-9B `6e41541`: V* `175/191 = 91.62%`; the other three formal cells are missing.
-- Locally trained Vision-OPD-9B B1 crop step65: V* 89.01, MMStar 78.33, **BLINK-exact** 40.77, ZoomBench 60.24.
+## Repository layout
 
-`BLINK-v5` and `BLINK-exact/v14` are not interchangeable. See [`docs/RESULTS.md`](docs/RESULTS.md) before comparing rows.
+```text
+configs/                 exact SFT, OPD, and artifact contracts
+scripts/                 portable preparation/train/export/evaluation commands
+src/hw_bjtu_opd/         relative-path data adapter and lightweight evaluator
+repro/                   source-frozen historical launchers and evaluators
+patches/                 complete public-base veRL patch and CPU contract tests
+results/                 aggregate results and artifact manifests
+docs/                    data, result, and reproducibility details
+hf_card/                 Hugging Face release cards
+```
 
-## 1. Environment
+Large checkpoints, benchmark payloads, caches, raw predictions, and
+credentials are excluded from Git.
 
-The successful environment used Python 3.12 and the exact package versions in [`requirements-repro.txt`](requirements-repro.txt), including PyTorch 2.10.0, Transformers 5.5.0, vLLM 0.18.0, FlashAttention 2.8.3.post1 and Ray 2.53.0. Use a CUDA driver/toolkit compatible with the selected PyTorch wheel.
+## Training environment
+
+Training is substantially more expensive than evaluation and uses the fuller
+environment:
 
 ```bash
 python3.12 -m venv .venv
@@ -65,25 +124,25 @@ source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r requirements-repro.txt
 
-# Fetch exact upstream revisions, apply the local veRL patch and install it.
 PYTHON_BIN="$PWD/.venv/bin/python" scripts/bootstrap.sh
 ```
 
-If FlashAttention must compile locally, install it after PyTorch with `--no-build-isolation`. `scripts/bootstrap.sh` pins:
+`scripts/bootstrap.sh` uses only public, fetchable source revisions:
 
-- veRL `c282ca53a025f00687f53b55b0eb890bf92a9840` plus the included patch;
+- veRL base `11c94ad2354456d9bfa93c558e05e9430cd731b2`, plus the complete
+  [`patches/verl-qwen35-opd.patch`](patches/verl-qwen35-opd.patch);
 - Vision-OPD `c8a8fdd1f88eef1b5ef4fe6a8d64eb0272917471`;
 - VLMEvalKit `09874c7a69c2a3c7c60ace141525c1552a2c1095`.
 
-The patch is part of the training implementation, not an optional performance tweak. It adds the fixed privileged teacher view, Qwen3.5 distillation control flow, FSDP export fixes and CPU contract tests used by these runs.
+The standalone patched veRL checkout is the SFT runtime. OPD intentionally
+uses the pinned Vision-OPD checkout's vendored veRL, matching the successful
+run. This distinction fixes the former README pin/runtime mismatch.
 
-## 2. Download released artifacts
+## Download the SFT initialization and data
 
 ```bash
 hf download HWBJTUOPD/HW-BJTU-OPD --local-dir artifacts/hw-bjtu-opd
 ```
-
-Important paths after download:
 
 ```text
 artifacts/hw-bjtu-opd/
@@ -95,57 +154,17 @@ artifacts/hw-bjtu-opd/
     └── media/...
 ```
 
-The portable Parquet has a new hash because its absolute media paths were rewritten. `manifest.json` binds it to the exact original research Parquet SHA256 `9f56d58c…a8c49b0`. See [`docs/DATA.md`](docs/DATA.md).
+The portable SFT Parquet SHA256 is
+`bcc980bf809f6905fa9aab978e59ee8884c45258f6e69c289bf63547aa2dc859`.
+Its hash differs from the research copy because machine-local image paths were
+rewritten to relative paths; both accepted identities are recorded by the SFT
+launchers.
 
-## 3. Train SFT_V1 10K
+## Prepare Vision-OPD-6K
 
-Download the raw Qwen3.5 base model first. The launcher is dry-run by default and only starts training with `--execute`.
-
-### Qwen3.5-9B
-
-```bash
-python scripts/train_sft.py \
-  --config configs/sft_v1_10k_9b.json \
-  --model /path/to/Qwen3.5-9B \
-  --data artifacts/hw-bjtu-opd/datasets/sft-v1-10k/train_10000.parquet \
-  --output outputs/qwen35-9b-sft-v1-10k \
-  --verl-root third_party/verl \
-  --python "$PWD/.venv/bin/python" \
-  --execute
-```
-
-This exposes all 10,000 rows exactly once: global batch 80, 125 optimizer steps, LoRA rank/alpha 16, LR `2e-5`, max length 16,384, dynamic batches and deterministic length bucketing.
-
-### Qwen3.5-27B
-
-Use the same command with:
-
-```text
---config configs/sft_v1_10k_27b.json
---model /path/to/Qwen3.5-27B
---output outputs/qwen35-27b-sft-v1-10k
-```
-
-The 27B recipe uses LR `1e-5` and max length 9,216; all other controlled settings remain aligned.
-
-### Export and merge SFT
-
-For the terminal 9B checkpoint, for example:
-
-```bash
-scripts/export_sft_checkpoint.sh \
-  --python "$PWD/.venv/bin/python" \
-  --verl-root third_party/verl \
-  --checkpoint outputs/qwen35-9b-sft-v1-10k/checkpoints/global_step_125 \
-  --base-model /path/to/Qwen3.5-9B \
-  --output outputs/qwen35-9b-sft-v1-10k-merged
-```
-
-The exporter first uses `verl.model_merger` to recover the LoRA adapter from FSDP and then uses the included Qwen3.5 sharded merger. The latter verifies the exact tensor-key universe and rejects residual LoRA tensors.
-
-## 4. Prepare Vision-OPD-6K
-
-The pinned source is `yuanqianhao/Vision-OPD-6K`. Build and decontaminate it against your local official benchmark denylist:
+The project does not duplicate roughly 37 GB of upstream Vision-OPD media.
+Instead, the preparation script downloads the exact public revision and
+verifies its source files before extraction:
 
 ```bash
 export PYTHONPATH="$PWD/repro/data_tools"
@@ -155,71 +174,75 @@ python repro/data_tools/prepare_vision_opd_6k.py \
   --raw-root data/vision-opd-6k/raw \
   --media-root data/vision-opd-6k/media \
   --output-dir data/vision-opd-6k/processed
-
-python repro/data_tools/validate_vision_opd_6k.py \
-  --raw-root data/vision-opd-6k/raw \
-  --media-root data/vision-opd-6k/media \
-  --output-dir data/vision-opd-6k/processed \
-  --manifest-dir data/vision-opd-6k/manifest \
-  --denylist-dir /path/to/four-benchmark-denylists
 ```
 
-The OPD launcher expects `data/vision-opd-6k/processed/train_decontaminated.parquet` with exactly 6,241 rows.
+The released decontamination audit excluded zero rows, so the generated
+6,241-row `processed/train.parquet` has the same training rows as the
+historical `train_decontaminated.parquet`. Its byte hash is expected to differ
+across machines because the Parquet records resolved media roots. The pinned
+source revision, source checksums, row count, views, and row order are the
+portable identity. See [`docs/DATA.md`](docs/DATA.md) for the optional full
+denylist audit.
 
-## 5. Train crop OPD
+## Reproduce the released OPD training arm
 
-The released final configuration uses the two merged SFT checkpoints as student and teacher. It uses **only the existing eight GPUs**.
+Launchers are dry-run by default and require `--execute` to write or train.
+From-scratch OPD reproduction requires eight GPUs and both initial 9B SFT
+roles point to the same released checkpoint:
 
 ```bash
 python scripts/train_opd.py \
-  --config configs/opd_vision6k_crop_sft27_teacher.json \
+  --config configs/opd_vision6k_crop_sft9_teacher.json \
   --student artifacts/hw-bjtu-opd/checkpoints/qwen35-9b-sft-v1-10k \
-  --teacher artifacts/hw-bjtu-opd/checkpoints/qwen35-27b-sft-v1-10k \
-  --data data/vision-opd-6k/processed/train_decontaminated.parquet \
-  --output outputs/sft9-vision6k-crop-sft27-teacher \
-  --verl-root third_party/verl \
+  --teacher artifacts/hw-bjtu-opd/checkpoints/qwen35-9b-sft-v1-10k \
+  --data data/vision-opd-6k/processed/train.parquet \
+  --output outputs/sft9-vision6k-crop-sft9-teacher \
   --vision-opd-root third_party/Vision-OPD \
   --python "$PWD/.venv/bin/python" \
   --execute
 ```
 
-To reproduce the 9B-teacher comparison, switch to `configs/opd_vision6k_crop_sft9_teacher.json` and point `--teacher` to the 9B SFT checkpoint.
+The OPD stage does not train against dataset answers: the reward model is
+disabled and the objective distils teacher token distributions over model
+rollouts. The teacher receives `bbox_images`; the student receives `images`.
+`teacher_update_rate=0` keeps the teacher fixed.
 
-The OPD stage does **not** train on dataset answers. `reward_model.enable=False`, no reward function is configured, and the objective is teacher-token distillation over model rollouts. Crop OPD means the student and teacher receive different image fields; the teacher truly receives the cropped region, not merely the red-box image.
-
-Export the terminal OPD actor:
+Export the final actor with the same vendored runtime:
 
 ```bash
-PYTHON_BIN="$PWD/.venv/bin/python" VERL_ROOT="$PWD/third_party/verl" \
+PYTHON_BIN="$PWD/.venv/bin/python" \
+VISION_OPD_ROOT="$PWD/third_party/Vision-OPD" \
   scripts/export_opd_checkpoint.sh \
-  --checkpoint outputs/sft9-vision6k-crop-sft27-teacher/checkpoints/global_step_65/actor \
-  --output outputs/sft9-vision6k-crop-sft27-teacher-hf
+  --checkpoint outputs/sft9-vision6k-crop-sft9-teacher/checkpoints/global_step_65/actor \
+  --output outputs/sft9-vision6k-crop-sft9-teacher-hf
 ```
 
-## 6. Evaluate V*, MMStar, BLINK and ZoomBench
+SFT training and merge commands are documented in
+[`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md); most users can use the
+released merged initialization directly.
 
-The exact aggregate-only protocol code is under `repro/eval_tools`. Benchmark payloads are not redistributed. Place official VStar/MMStar/BLINK/ZoomBench assets under your workspace as described by the upstream projects, and configure the frozen ZoomBench judge.
+## Full four-benchmark evaluation
 
-```bash
-export OPD_QWEN35_WORKSPACE=/path/to/H_Workspace
-export TRAIN_PYTHON="$PWD/.venv/bin/python"
-export OPD_GPU_LOCK="$OPD_QWEN35_WORKSPACE/Locks/opd_gpu_0_7.lock"
+The simple public path deliberately targets VStar. The frozen full chain under
+`repro/eval_tools/` is retained for audit and includes VStar, MMStar, BLINK-v5,
+and ZoomBench, but it is an advanced historical workflow: it requires all
+official benchmark assets, eight candidate GPUs, and a separate Qwen3.5-27B
+ZoomBench semantic judge pinned at
+`fc05daec18b0a78c049392ed2e771dde82bdf654`. It should not be mistaken for a
+low-cost one-command test. Raw predictions and benchmark gold data are not
+redistributed; exact aggregate, dataset, evaluator, and judge receipts are in
+[`results/released_opd9_teacher.json`](results/released_opd9_teacher.json).
 
-# Omit --execute for a validated dry run.
-scripts/evaluate_fourbench.sh \
-  --model-path outputs/sft9-vision6k-crop-sft27-teacher-hf \
-  --model-id Qwen3.5-9B-SFT10K-Vision6K-Crop-SFT27Teacher \
-  --run-root "$OPD_QWEN35_WORKSPACE/Output/release_eval" \
-  --execute
-```
+## Reproducibility and licenses
 
-Evaluation is serial on the same eight GPUs: one resident model service for V*/MMStar/ZoomBench, then the frozen BLINK-v5 service. Expected totals are 191, 1,500, 1,901 and 845. Any invalid BLINK output counts as wrong. The raw prediction files remain private; the final `summary.json` is aggregate-only.
+- [`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md) defines source, runtime,
+  training, and evaluation contracts.
+- [`docs/DATA.md`](docs/DATA.md) records data identities and path portability.
+- [`docs/RESULTS.md`](docs/RESULTS.md) records result authorities and protocol
+  distinctions.
+- [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) records upstream licenses.
 
-## Reproducibility and licensing
-
-- [`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md) records the exact source, view, optimizer and evaluation contracts.
-- [`docs/RESULTS.md`](docs/RESULTS.md) explains result authorities and the two BLINK protocols.
-- [`docs/DATA.md`](docs/DATA.md) records data composition, decontamination and path sanitization.
-- [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) records upstream projects and dataset licenses.
-
-Never commit access tokens, `.env` files, raw predictions, benchmark gold data or model weights to this Git repository.
+The code and released model are Apache-2.0, subject to upstream Qwen terms.
+Dataset and benchmark assets retain their own licenses. Never commit access
+tokens, `.env` files, benchmark gold data, raw predictions, or model weights
+to this Git repository.

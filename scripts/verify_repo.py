@@ -70,6 +70,21 @@ def main() -> int:
     patch = ROOT / "patches/verl-qwen35-opd.patch"
     if not patch.is_file() or patch.stat().st_size < 10_000:
         errors.append("veRL release patch is missing or unexpectedly small")
+    bootstrap = (ROOT / "scripts/bootstrap.sh").read_text(encoding="utf-8")
+    public_verl_base = "11c94ad2354456d9bfa93c558e05e9430cd731b2"
+    unavailable_verl_pin = "c282ca53a025f00687f53b55b0eb890bf92a9840"
+    if public_verl_base not in bootstrap or unavailable_verl_pin in bootstrap:
+        errors.append("bootstrap does not use the public veRL base revision")
+    artifact = json.loads((ROOT / "configs/opd9_teacher_artifact.json").read_text(encoding="utf-8"))
+    expected_model_sha = "c86054edddaf186b5a0754fed55e4d8e80108ba2081ff7e6ba7c2d3e589ccdc7"
+    if artifact.get("model", {}).get("sha256") != expected_model_sha:
+        errors.append("released OPD model SHA256 differs")
+    if len(artifact.get("model", {}).get("required_files", [])) != 7:
+        errors.append("released OPD artifact must bind exactly seven files")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    model_repo = "HWBJTUOPD/Qwen3.5-9B-SFT10K-VisionOPD6K-SFT9BTeacher"
+    if model_repo not in readme or "scripts/evaluate_vstar.sh --execute" not in readme:
+        errors.append("README does not expose the released model and simple evaluation entry")
     if errors:
         print(json.dumps({"status": "failed", "errors": errors}, indent=2), file=sys.stderr)
         return 2

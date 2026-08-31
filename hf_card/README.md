@@ -66,7 +66,9 @@ The BLINK column is the local deterministic checkpoint-comparison v5 protocol, n
 | Raw Qwen3.5-27B | 86.39 | 79.33 | 50.97 | 57.63 | 68.58 |
 | Qwen3.5-27B SFT_V1 10K | 86.39 | 79.87 | 62.65 | 58.70 | 71.90 |
 
-These SFT models are also the student/teacher initializations for the best current OPD experiment: 9B SFT student + Vision-OPD-6K crop + fixed 27B SFT teacher, which scores 93.72/76.20/66.02/63.55 and a 74.87 macro under the same four protocols. That OPD checkpoint is not part of this artifact release.
+These SFT models are also the student/teacher initializations for the OPD
+experiments. The released 9B-teacher OPD student is available separately at
+[`HWBJTUOPD/Qwen3.5-9B-SFT10K-VisionOPD6K-SFT9BTeacher`](https://huggingface.co/HWBJTUOPD/Qwen3.5-9B-SFT10K-VisionOPD6K-SFT9BTeacher).
 
 ## Dataset
 

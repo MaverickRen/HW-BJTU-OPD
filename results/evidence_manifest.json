@@ -2,6 +2,21 @@
   "schema_version": "hw_bjtu_opd_result_evidence_manifest_v1",
   "aggregate_only": true,
   "sample_level_data_included": false,
+  "released_artifact": {
+    "repo_id": "HWBJTUOPD/Qwen3.5-9B-SFT10K-VisionOPD6K-SFT9BTeacher",
+    "revision": "6fc7d1ed7c509572898a32ff9de6cff19e8455f0",
+    "model_sha256": "c86054edddaf186b5a0754fed55e4d8e80108ba2081ff7e6ba7c2d3e589ccdc7",
+    "identity_sha256": "2e542f93ecd7ecdebc1ad4514d4f4c118923138c5324a4fe0f30dfbddb8a71d5"
+  },
+  "public_vstar_gate": {
+    "dataset_repo_id": "lmms-lab/vstar-bench",
+    "dataset_revision": "b44023b4dca749ed8a76b85eb576627d05a1c174",
+    "source_parquet_sha256": "6f9a089e93e75931350157544f8e74713d9d108c5f73585609ca262c33528a27",
+    "logical_rows_sha256": "1025f0c463281944034cd79f806aa80d44a82b35453463ab4288429c46f64a2f",
+    "image_manifest_sha256": "0874addfe852aad054879a7020bf3dae880b6ea49ffb7f94eab5b23362444a6c",
+    "reference": {"correct": 176, "total": 191},
+    "similarity_tolerance_correct": 3
+  },
   "authorities": [
     {
       "logical_name": "required_fourbench_matrix_20260815_v1",

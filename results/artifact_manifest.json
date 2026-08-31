@@ -26,6 +26,27 @@
         {"bytes": 2542796928, "name": "model-00012-of-00012.safetensors", "sha256": "4c1ebaabbaca559789304b32d41530fb890cb406d30b4113f2e0e754a05dc93d"}
       ],
       "merge_receipt_sha256": "e82d49051bd02df5a04c8c6a647150dfe75af4c3bc052937072a27c57af2bb92"
+    },
+    "qwen35-9b-sft10k-visionopd6k-sft9b-teacher": {
+      "repo_id": "HWBJTUOPD/Qwen3.5-9B-SFT10K-VisionOPD6K-SFT9BTeacher",
+      "release_revision": "6fc7d1ed7c509572898a32ff9de6cff19e8455f0",
+      "artifact_id": "qwen35-9b-vision-opd-sft9-teacher-full8-s65-v1",
+      "weight_files": [
+        {
+          "bytes": 18819722392,
+          "name": "model.safetensors",
+          "sha256": "c86054edddaf186b5a0754fed55e4d8e80108ba2081ff7e6ba7c2d3e589ccdc7"
+        }
+      ],
+      "identity_sha256": "2e542f93ecd7ecdebc1ad4514d4f4c118923138c5324a4fe0f30dfbddb8a71d5",
+      "required_file_count": 7,
+      "evaluation": {
+        "vstar": {"correct": 176, "total": 191},
+        "mmstar": {"correct": 1159, "total": 1500},
+        "blink_v5": {"correct": 1263, "total": 1901},
+        "zoombench": {"correct": 525, "total": 845},
+        "macro_percent": 74.49553937627918
+      }
     }
   },
   "dataset": {

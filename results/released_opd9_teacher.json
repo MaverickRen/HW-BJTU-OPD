@@ -1,0 +1,67 @@
+{
+  "schema_version": "hw_bjtu_opd_released_opd9_teacher_v1",
+  "status": "complete",
+  "aggregate_only": true,
+  "sample_level_output": false,
+  "artifact": {
+    "repo_id": "HWBJTUOPD/Qwen3.5-9B-SFT10K-VisionOPD6K-SFT9BTeacher",
+    "revision": "6fc7d1ed7c509572898a32ff9de6cff19e8455f0",
+    "artifact_id": "qwen35-9b-vision-opd-sft9-teacher-full8-s65-v1",
+    "model_sha256": "c86054edddaf186b5a0754fed55e4d8e80108ba2081ff7e6ba7c2d3e589ccdc7",
+    "identity_sha256": "2e542f93ecd7ecdebc1ad4514d4f4c118923138c5324a4fe0f30dfbddb8a71d5"
+  },
+  "benchmark_order": ["VStar", "MMStar", "BLINK-v5", "ZoomBench"],
+  "benchmarks": {
+    "VStar": {
+      "correct": 176,
+      "total": 191,
+      "percent": 92.14659685863874,
+      "protocol": "vstar_frozen_first_option_v1",
+      "protocol_hash": "55fe9e9013c5a38e20e29446f07106ef9ab482be0f79332676aef9a4bfa07d98",
+      "aggregate_sha256": "17132d2f94b34ac7c5691b6cac60b87dc7001ce1a34ad5bb3dd647ba8dee9556"
+    },
+    "MMStar": {
+      "correct": 1159,
+      "total": 1500,
+      "percent": 77.26666666666667,
+      "protocol": "mmstar_qwen35_modelcard_thinking_v2",
+      "protocol_hash": "3d1baa4687ad3b5607cd622d0fef4e88f60f0f5c14bbe54d7b0ce0d1de221c17",
+      "aggregate_sha256": "4c80ba2e66b81b68013ee2ce864b53632515ba163381bea34833d7d28e463a9d"
+    },
+    "BLINK-v5": {
+      "correct": 1263,
+      "total": 1901,
+      "percent": 66.43871646501842,
+      "protocol": "blink_deterministic_checkpoint_comparison_v5",
+      "protocol_hash": "ab5754c61c01c3c761c9fd72ae37480163884e894ffdb38cb805fe96b54204dc",
+      "aggregate_sha256": "6cec06cba36a31da79fe0b44f435f5e3080d14a3aaf5bec9d332eb58c20b7619"
+    },
+    "ZoomBench": {
+      "correct": 525,
+      "total": 845,
+      "percent": 62.1301775147929,
+      "protocol": "zoombench_score_aggregate_v1",
+      "protocol_hash": "de79d40ac9916300db8a139a851727bf6bcb4fb016e9c659bf77609f9cb19f5a",
+      "aggregate_sha256": "2af717fd4366a81a30e01e447eaf5c928d640c9b8086850389d647f7ea4fd873",
+      "dataset": {
+        "repo_id": "inclusionAI/ZoomBench",
+        "revision": "b788097e57d30510c6877824833234a73bf80d25",
+        "source_parquet_sha256": "d44ebda2eda485cba055181f4e6dc50c42f81b5d0f7e936bf427fa01502a391a",
+        "official_eval_commit": "fdc0ba1a3dee916d8c38304d543ad414879e0c99"
+      },
+      "semantic_judge": {
+        "repo_id": "Qwen/Qwen3.5-27B",
+        "revision": "fc05daec18b0a78c049392ed2e771dde82bdf654",
+        "identity_sha256": "a9e26e80efcdf9eea4bb01544d817cd4fac0db4241c545ab24666b3ba49c003c",
+        "acceptance_rule": "strip_lower_equals_yes"
+      }
+    }
+  },
+  "four_benchmark_macro_percent": 74.49553937627918,
+  "historical_topology": {
+    "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+    "tensor_parallel_size": 8,
+    "model_serial": true,
+    "candidate_seed": 42
+  }
+}

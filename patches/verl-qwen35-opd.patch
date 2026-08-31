@@ -1,11 +1,11 @@
 diff --git a/tests/test_protocol_v2_on_cpu.py b/tests/test_protocol_v2_on_cpu.py
-index 63d0ee47..fc3bd6d6 100644
+index 63d0ee478077c6f69d82984a3955776902036c43..fc3bd6d654eaee97cfb8f25d163beee37836732a 100644
 --- a/tests/test_protocol_v2_on_cpu.py
 +++ b/tests/test_protocol_v2_on_cpu.py
 @@ -149,6 +149,39 @@ def test_index_select_tensor_dict_preserves_3d_nested_tensor_layout_with_equal_s
      tu.assert_tensordict_eq(selected, tu.get_tensordict({"position_ids": expected}))
-
-
+ 
+ 
 +def test_maybe_fix_3d_position_ids_rebuilds_tq_single_sample_offsets_before_chunk():
 +    seq_len = 17
 +    input_ids = torch.nested.as_nested_tensor([torch.arange(seq_len)], layout=torch.jagged)
@@ -44,8 +44,8 @@ index 63d0ee47..fc3bd6d6 100644
      vocab_size = 128
 @@ -885,6 +918,28 @@ def test_chunk_tensordict_preserves_3d_nested_tensor_layout_with_equal_seq_len_p
      assert torch.equal(chunks[1]["position_ids"].offsets(), expected_chunk_1.offsets())
-
-
+ 
+ 
 +def test_chunk_tensordict_padded_fallback_slices_axis_major_position_ids(monkeypatch):
 +    elements = [torch.arange(4 * seq_len).reshape(4, seq_len) for seq_len in (5, 8, 3, 7)]
 +    position_ids = torch.nested.as_nested_tensor(elements, layout=torch.jagged)
@@ -72,17 +72,17 @@ index 63d0ee47..fc3bd6d6 100644
      """Regression test: chunk_tensordict must handle nested tensors where the ragged dimension is not the last one."""
      topk = 64
 diff --git a/tests/utils/test_padding_on_cpu.py b/tests/utils/test_padding_on_cpu.py
-index fc1a28f9..c0179c54 100644
+index fc1a28f910b5833801310da3b84aaac6fa376ef0..c0179c542e6dc56f9dab7ca3258714553718bb26 100644
 --- a/tests/utils/test_padding_on_cpu.py
 +++ b/tests/utils/test_padding_on_cpu.py
 @@ -13,6 +13,7 @@
  # limitations under the License.
  import random
-
+ 
 +import pytest
  import torch
  from tensordict import TensorDict
-
+ 
 @@ -21,11 +22,62 @@ from verl.workers.utils.padding import (
      embeds_padding_2_no_padding,
      left_right_2_no_padding,
@@ -91,8 +91,8 @@ index fc1a28f9..c0179c54 100644
      response_from_nested,
      response_to_nested,
  )
-
-
+ 
+ 
 +def test_pack_position_ids_uses_physical_layout_not_ragged_metadata():
 +    seq_lens = [5, 3]
 +    per_sample_axis_major = [
@@ -145,21 +145,21 @@ index fc1a28f9..c0179c54 100644
 +
  def test_padding_conversion_with_log_probs():
      """Test that log probability tensors remain in padded format after conversion
-
+ 
 diff --git a/tests/utils/test_tracking_on_cpu.py b/tests/utils/test_tracking_on_cpu.py
-index 85842871..9e3100ca 100644
+index 85842871c541d25bd7c539bc774830bad1c9f87f..9e3100ca0c5d78aa8b0b627cb23496309487422f 100644
 --- a/tests/utils/test_tracking_on_cpu.py
 +++ b/tests/utils/test_tracking_on_cpu.py
 @@ -16,7 +16,9 @@ import sys
  import types
  from unittest.mock import MagicMock, patch
-
+ 
 -from verl.utils.tracking import ValidationGenerationsLogger
 +import torch
 +
 +from verl.utils.tracking import ValidationGenerationsLogger, _TensorboardAdapter
-
-
+ 
+ 
  def test_validation_generations_logger_logs_trackio_traces():
 @@ -46,3 +48,32 @@ def test_validation_generations_logger_logs_trackio_traces():
      assert trace_kwargs["metadata"]["score"] == 0.5
@@ -195,13 +195,13 @@ index 85842871..9e3100ca 100644
 +    writer.add_scalar.assert_any_call("one_element_tensor", torch.tensor([0.5]), 1)
 +    writer.add_text.assert_called_once_with("training/reward_status", "unavailable", 1)
 diff --git a/tests/utils/test_vllm_weight_name_normalization_on_cpu.py b/tests/utils/test_vllm_weight_name_normalization_on_cpu.py
-index b11c0590..64d6afb6 100644
+index b11c059068317742cd9b4b8b76a1fa1bb4ec99af..64d6afb6529afe7c0b0d5e94a16e9176fd6c19d5 100644
 --- a/tests/utils/test_vllm_weight_name_normalization_on_cpu.py
 +++ b/tests/utils/test_vllm_weight_name_normalization_on_cpu.py
 @@ -182,6 +182,24 @@ def test_maybe_reload_standard_weights_falls_back_without_reload_api():
      assert worker._maybe_reload_standard_weights_from_ipc(_UnusedReceiver()) is False
-
-
+ 
+ 
 +def test_maybe_reload_standard_weights_falls_back_for_legacy_reload_api():
 +    """vLLM 0.11/0.12 reload_weights() cannot consume an IPC weight iterator."""
 +
@@ -222,9 +222,150 @@ index b11c0590..64d6afb6 100644
 +
  def test_update_weights_normalizes_base_layer_names_before_fp8(monkeypatch):
      import verl.workers.rollout.vllm_rollout.utils as worker_utils
-
+ 
+diff --git a/tests/workers/rollout/test_vllm_prompt_logprobs_on_cpu.py b/tests/workers/rollout/test_vllm_prompt_logprobs_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a2501460b0236cb817530eaabf8c4536914ff65
+--- /dev/null
++++ b/tests/workers/rollout/test_vllm_prompt_logprobs_on_cpu.py
+@@ -0,0 +1,135 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from types import SimpleNamespace
++
++import pytest
++
++from verl.experimental.teacher_loop.teacher_manager import _get_teacher_sampling_params
++from verl.workers.rollout.vllm_rollout.utils import extract_prompt_logprobs
++
++
++class _FakeLogprob:
++    def __init__(self, rank, logprob):
++        self.rank = rank
++        self.logprob = logprob
++
++
++def _output(*rows):
++    # The first prompt token has no causal logprob and is skipped by the
++    # extractor, just as in vLLM's RequestOutput.
++    return SimpleNamespace(prompt_logprobs=[None, *rows])
++
++
++def _extract(output, width):
++    result = {}
++    extract_prompt_logprobs(output, width, result)
++    return result
++
++
++def test_extract_prompt_logprobs_preserves_full_topk_width_on_cpu():
++    result = _extract(
++        _output(
++            {
++                10: _FakeLogprob(1, -0.1),
++                11: _FakeLogprob(2, -0.2),
++                12: _FakeLogprob(3, -0.3),
++            }
++        ),
++        3,
++    )
++
++    assert result["prompt_ids"] == [[10, 11, 12], [0, 0, 0]]
++    assert result["prompt_logprobs"][0] == pytest.approx([-0.1, -0.2, -0.3])
++    assert result["prompt_logprobs"][1] == [0.0] * 3
++
++
++def test_extract_prompt_logprobs_ignores_sampled_token_after_topk_on_cpu():
++    result = _extract(
++        _output(
++            {
++                20: _FakeLogprob(1, -0.1),
++                21: _FakeLogprob(2, -0.2),
++                22: _FakeLogprob(3, -0.3),
++                # vLLM may include the sampled token at rank K + 1.
++                99: _FakeLogprob(4, -9.9),
++            }
++        ),
++        3,
++    )
++
++    assert result["prompt_ids"][0] == [20, 21, 22]
++    assert result["prompt_logprobs"][0] == pytest.approx([-0.1, -0.2, -0.3])
++
++
++@pytest.mark.parametrize(
++    "row,error",
++    [
++        ({30: _FakeLogprob(1, -0.1), 31: _FakeLogprob(3, -0.3)}, "incomplete"),
++        ({30: _FakeLogprob(1, -0.1), -1: _FakeLogprob(2, -0.2)}, "sentinel"),
++        ({30: _FakeLogprob(1, -0.1), 31: _FakeLogprob(None, -0.2)}, "rank"),
++        ({30: _FakeLogprob(1, -0.1), 31: _FakeLogprob(2, float("nan"))}, "finite"),
++    ],
++)
++def test_extract_prompt_logprobs_rejects_incomplete_or_sentinel_rows_on_cpu(row, error):
++    with pytest.raises((TypeError, ValueError), match=error):
++        _extract(_output(row), 2)
++
++
++def test_extract_prompt_logprobs_rejects_out_of_vocabulary_id_on_cpu():
++    result = {}
++    with pytest.raises(ValueError, match="outside vocabulary"):
++        extract_prompt_logprobs(
++            _output({10: _FakeLogprob(1, -0.1), 101: _FakeLogprob(2, -0.2)}),
++            2,
++            result,
++            vocab_size=100,
++        )
++
++
++def test_extract_prompt_logprobs_preserves_real_negative_infinity_on_cpu():
++    result = _extract(
++        _output({30: _FakeLogprob(1, -0.1), 31: _FakeLogprob(2, float("-inf"))}),
++        2,
++    )
++    assert result["prompt_ids"][0] == [30, 31]
++    assert result["prompt_logprobs"][0] == [-0.1, float("-inf")]
++
++
++def test_extract_prompt_logprobs_rejects_too_many_well_formed_entries_on_cpu():
++    with pytest.raises(ValueError, match="sampled entries"):
++        _extract(
++            _output(
++                {
++                    40: _FakeLogprob(1, -0.1),
++                    41: _FakeLogprob(2, -0.2),
++                    42: _FakeLogprob(3, -0.3),
++                    43: _FakeLogprob(4, -0.4),
++                    44: _FakeLogprob(5, -0.5),
++                }
++            ),
++            3,
++        )
++
++
++def test_teacher_sampling_disables_detokenization_for_prompt_logprobs_on_cpu():
++    teacher_config = SimpleNamespace(inference=SimpleNamespace(temperature=1.0))
++    loss_config = SimpleNamespace(topk=128, loss_settings=SimpleNamespace(use_topk=True))
++
++    sampling_params = _get_teacher_sampling_params(teacher_config, loss_config)
++
++    assert sampling_params["max_tokens"] == 1
++    assert sampling_params["temperature"] == 1.0
++    assert sampling_params["detokenize"] is False
++    assert sampling_params["prompt_logprobs"] == 128
 diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
-index 1bd98610..a3eacd74 100644
+index 1bd98610dbb5f668d697dbc9c0563c752410e72b..a3eacd743d8adb64dd73c08c18cccaa108fd2277 100644
 --- a/verl/experimental/agent_loop/agent_loop.py
 +++ b/verl/experimental/agent_loop/agent_loop.py
 @@ -32,6 +32,8 @@ import logging
@@ -235,7 +376,7 @@ index 1bd98610..a3eacd74 100644
 +from io import BytesIO
  from typing import Any, Optional
  from uuid import uuid4
-
+ 
 @@ -48,7 +50,7 @@ from transformers import AutoProcessor, AutoTokenizer
  from verl.experimental.agent_loop.utils import resolve_config_path
  from verl.protocol import DataProto
@@ -254,14 +395,14 @@ index 1bd98610..a3eacd74 100644
 +        self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
 +        self.mm_processor_kwargs = self.data_config.get("mm_processor_kwargs", {})
 +        self.loop = get_event_loop()
-
+ 
          # Online policy distillation
          self.distillation_enabled = is_distillation_enabled(config.distillation)
 +        self.distillation_only = is_distillation_only(config.distillation)
 +        self.distillation_config = None
          if self.distillation_enabled:
              from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
-
+ 
 -            self.teacher_key: str = config.distillation.teacher_key
 +            from verl.workers.config import DistillationConfig
 +
@@ -273,7 +414,7 @@ index 1bd98610..a3eacd74 100644
 @@ -564,6 +574,33 @@ class AgentLoopWorker:
                  mm_processor_kwargs["sampling_rate"] = int(sampling_rate)
          return mm_processor_kwargs
-
+ 
 +    async def _process_teacher_multi_modal_info(self, messages: list[dict]) -> dict[str, Any]:
 +        """Use the same dataset-owned multimodal extraction as the student prompt."""
 +        return await AgentLoopBase.process_multi_modal_info(self, messages)
@@ -303,7 +444,7 @@ index 1bd98610..a3eacd74 100644
 +
      async def generate_sequences(self, batch: DataProto) -> DataProto:
          """Generate sequences from agent loop.
-
+ 
 @@ -817,7 +854,8 @@ class AgentLoopWorker:
                  output.multi_modal_data.get("audios") if output.multi_modal_data else None
              ),
@@ -315,7 +456,7 @@ index 1bd98610..a3eacd74 100644
              output,
              prompt_ids=output.prompt_ids,
 @@ -941,6 +979,12 @@ class AgentLoopWorker:
-
+ 
      async def _compute_score(self, outputs: list[AgentLoopOutput], kwargs: dict) -> None:
          """Compute reward score for all outputs in a trajectory; assigns result to outputs[-1]."""
 +        # A supervised top-k distillation rollout has no task reward.  In
@@ -325,12 +466,12 @@ index 1bd98610..a3eacd74 100644
 +        if is_distillation_only(getattr(self, "distillation_config", None)):
 +            return
          enable_async_reward = self.reward_loop_worker_handles is not None
-
+ 
          final_output = outputs[-1]
 @@ -1003,6 +1047,229 @@ class AgentLoopWorker:
                  final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
              final_output.metrics.compute_score = timing["compute_score"]
-
+ 
 +    @staticmethod
 +    def _teacher_image_values(value: Any) -> list[Any]:
 +        """Normalize a non-tensor dataset column without accepting silent holes."""
@@ -607,11 +748,11 @@ index 1bd98610..a3eacd74 100644
              output.extra_fields["teacher_logprobs"] = teacher_logprobs
 +            if teacher_input_evidence is not None:
 +                output.extra_fields["teacher_input_evidence"] = teacher_input_evidence
-
+ 
      def _postprocess(
          self,
 diff --git a/verl/experimental/reward_loop/reward_loop.py b/verl/experimental/reward_loop/reward_loop.py
-index 1f39aaa4..cb187f28 100644
+index 1f39aaa4f2615834e26f8e963d864fbdd237130a..cb187f28b302f3cd618e7264d3f05f436afb3c4b 100644
 --- a/verl/experimental/reward_loop/reward_loop.py
 +++ b/verl/experimental/reward_loop/reward_loop.py
 @@ -26,6 +26,7 @@ from tensordict import TensorDict
@@ -623,7 +764,7 @@ index 1f39aaa4..cb187f28 100644
  from verl.utils.fs import copy_to_local
  from verl.utils.ray_utils import get_event_loop
 @@ -278,15 +279,22 @@ class RewardLoopManager:
-
+ 
      def __init__(self, config: DictConfig, rm_resource_pool: RayResourcePool = None):
          self.config = config
 -        if self.config.reward.reward_model.enable:
@@ -640,13 +781,13 @@ index 1f39aaa4..cb187f28 100644
          else:
              self.reward_model_manager = None
              self.reward_router_address = None
-
+ 
 -        self.reward_loop_workers_class = ray.remote(RewardLoopWorker)
 -        self.reward_manager_cls = resolve_reward_manager_cls(config)
 +        self.reward_loop_workers_class = None if self.distillation_only else ray.remote(RewardLoopWorker)
 +        self.reward_manager_cls = None if self.distillation_only else resolve_reward_manager_cls(config)
          self._init_reward_loop_workers()
-
+ 
      @property
 @@ -297,12 +305,19 @@ class RewardLoopManager:
          (1) rule-based reward without reward model
@@ -657,7 +798,7 @@ index 1f39aaa4..cb187f28 100644
          if not self.config.reward.reward_model.enable or self.config.reward.reward_model.enable_resource_pool:
              return self.reward_loop_workers
          return None
-
+ 
      def _init_reward_loop_workers(self):
          self.reward_loop_workers = []
 +        # Pure top-k distillation does not have a task reward.  Avoid creating
@@ -667,24 +808,35 @@ index 1f39aaa4..cb187f28 100644
 +            return
          num_workers = self.config.reward.num_workers
          node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
-
+ 
 @@ -321,6 +336,8 @@ class RewardLoopManager:
              )
-
+ 
      def compute_rm_score(self, data: DataProto) -> DataProto:
 +        if self.distillation_only:
 +            raise RuntimeError("Pure distillation does not define task rewards")
          if self.reward_model_manager is not None:
              self.reward_model_manager.wake_up()
-
+ 
 diff --git a/verl/experimental/teacher_loop/teacher_manager.py b/verl/experimental/teacher_loop/teacher_manager.py
-index d9cb4c51..b070f95e 100644
+index 1fdb1d6a8d07e53b2a57364291fae480dad6cd6f..b070f95e1459a4f8f8a99dcaf8f22d847f7b89b7 100644
 --- a/verl/experimental/teacher_loop/teacher_manager.py
 +++ b/verl/experimental/teacher_loop/teacher_manager.py
-@@ -79,6 +79,76 @@ def _pad_teacher_outputs(
+@@ -53,6 +53,10 @@ def _get_teacher_sampling_params(
+         "max_tokens": 1,
+         "temperature": 1.0,
+         "prompt_logprobs": num_logprobs,
++        # Prompt-logprob requests do not need decoded text.  In particular,
++        # disabling detokenization keeps invalid/sentinel top-k ids from
++        # reaching vLLM's tokenizer conversion path.
++        "detokenize": False,
+     }
+ 
+ 
+@@ -75,6 +79,76 @@ def _pad_teacher_outputs(
      )
-
-
+ 
+ 
 +def align_teacher_response_outputs(
 +    teacher_ids: torch.Tensor,
 +    teacher_logprobs: torch.Tensor,
@@ -757,9 +909,9 @@ index d9cb4c51..b070f95e 100644
 +
  class AsyncTeacherLLMServerManager:
      """Teacher-specific async client used for distillation logprob computation."""
-
+ 
 diff --git a/verl/experimental/teacher_loop/teacher_model.py b/verl/experimental/teacher_loop/teacher_model.py
-index c8e9b2cc..b61196d7 100644
+index c8e9b2ccee53d7596ace36d1c7223117e8de3447..b61196d71ef150859020905e7f5eefc34076014a 100644
 --- a/verl/experimental/teacher_loop/teacher_model.py
 +++ b/verl/experimental/teacher_loop/teacher_model.py
 @@ -42,6 +42,7 @@ class TeacherModelManager:
@@ -783,7 +935,7 @@ index c8e9b2cc..b61196d7 100644
 -        self._initialize_load_balancer_handle()
 +        if not self.defer_server_launch:
 +            self._initialize_load_balancer_handle()
-
+ 
      def _initialize_llm_servers(self):
          teacher_model_config = self.teacher_model_config
 @@ -91,14 +98,35 @@ class TeacherModelManager:
@@ -820,7 +972,7 @@ index c8e9b2cc..b61196d7 100644
 +        _run_all([server.launch_servers() for server in self.rollout_replicas])
 +        self._record_server_handles()
 +        self._initialize_load_balancer_handle()
-
+ 
      def _validate_replica_node_alignment(self, replica_pools, per_replica_world_size, gpus_per_node):
          """Verify that each replica occupies the expected number of nodes.
 @@ -158,6 +186,7 @@ class MultiTeacherModelManager:
@@ -836,9 +988,9 @@ index c8e9b2cc..b61196d7 100644
          self.server_handles: dict[str, list] = {}
          self.load_balancer_handle: dict[str, object] = {}
 +        self.defer_server_launch = defer_server_launch
-
+ 
          self._initialize_teacher_model_managers()
-
+ 
 @@ -187,16 +217,36 @@ class MultiTeacherModelManager:
                  distillation_config=self.distillation_config,
                  teacher_model_config=teacher_model_config,
@@ -869,7 +1021,7 @@ index c8e9b2cc..b61196d7 100644
 +        for key, manager in self.teacher_model_managers.items():
 +            manager.launch_servers()
 +            self._record_manager(key, manager)
-
+ 
      def get_client(self) -> dict[str, LLMServerClient]:
          """Get the LLMServerClient for each teacher model."""
          teacher_clients = {}
@@ -880,12 +1032,12 @@ index c8e9b2cc..b61196d7 100644
                  config=self.config,
                  load_balancer_handle=manager.load_balancer_handle,
 diff --git a/verl/model_merger/base_model_merger.py b/verl/model_merger/base_model_merger.py
-index 54a682fa..bb98cfca 100644
+index 54a682fadb9926d56c60da8e827f9ef88133d081..bb98cfca143c0bf121465f01fa57eb5244c7ee79 100644
 --- a/verl/model_merger/base_model_merger.py
 +++ b/verl/model_merger/base_model_merger.py
 @@ -403,7 +403,19 @@ class BaseModelMerger(ABC):
          drop_tied_target_keys(state_dict, model, self.model_config)
-
+ 
          print(f"Saving model to {self.config.target_dir}")
 -        model.save_pretrained(self.config.target_dir, state_dict=state_dict)
 +        # The FSDP state dict already uses the current in-memory model names.
@@ -903,9 +1055,9 @@ index 54a682fa..bb98cfca 100644
 +        )
          del state_dict
          del model
-
+ 
 diff --git a/verl/single_controller/base/worker.py b/verl/single_controller/base/worker.py
-index afa3c4e4..c36f2975 100644
+index afa3c4e494c0787b8db9a0950dc450368bbf0367..c36f29755ec2128f772a97d4e994040598070fcc 100644
 --- a/verl/single_controller/base/worker.py
 +++ b/verl/single_controller/base/worker.py
 @@ -19,6 +19,7 @@ import os
@@ -913,13 +1065,13 @@ index afa3c4e4..c36f2975 100644
  import warnings
  from dataclasses import dataclass
 +from typing import Any, Mapping, Sequence
-
+ 
  import ray
-
+ 
 @@ -83,6 +84,38 @@ class Worker(WorkerHelper):
-
+ 
      fused_worker_attr_name = "fused_worker_dict"
-
+ 
 +    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
 +    def get_role_gpu_observation(self) -> dict[str, Any]:
 +        """Return the Ray-assigned GPU identity before model initialization.
@@ -954,7 +1106,7 @@ index afa3c4e4..c36f2975 100644
 +
      def _register_dispatch_collect_info(self, mesh_name: str, dp_rank: int, is_collect: bool):
          """Register the dp_rank for a given mesh name. This function is meant to be called by the worker
-
+ 
 @@ -346,3 +379,123 @@ class Worker(WorkerHelper):
          """
          result = func(*args, **kwargs)
@@ -1080,12 +1232,12 @@ index afa3c4e4..c36f2975 100644
 +        "observations": normalized,
 +    }
 diff --git a/verl/trainer/config/distillation/distillation.yaml b/verl/trainer/config/distillation/distillation.yaml
-index 84ee7932..fd6e7555 100644
+index 84ee7932ab6e59be21211c7b41554471558ab454..fd6e7555c4051643b8ce02f6acc32bb0b5a2b9f9 100644
 --- a/verl/trainer/config/distillation/distillation.yaml
 +++ b/verl/trainer/config/distillation/distillation.yaml
 @@ -110,4 +110,13 @@ teacher_models:
        temperature: ${oc.select:actor_rollout_ref.rollout.temperature}
-
+ 
  # Key to route examples to the appropriate teacher model in multi-teacher setups. Should correspond to a field in the data proto, e.g., task.
 -teacher_key: data_source
 \ No newline at end of file
@@ -1100,7 +1252,7 @@ index 84ee7932..fd6e7555 100644
 +# original multimodal prompt.  If false, a missing privileged image is fatal.
 +fallback_to_student_images: false
 diff --git a/verl/trainer/distillation/losses.py b/verl/trainer/distillation/losses.py
-index 3467e59e..b2421d46 100644
+index 3467e59ebaab061031499cadba5c37fac23f49b1..b2421d464edebe4b4ec1465189b145a2aeb3f280 100644
 --- a/verl/trainer/distillation/losses.py
 +++ b/verl/trainer/distillation/losses.py
 @@ -40,7 +40,38 @@ def is_distillation_enabled(config: Optional[DistillationConfig]) -> bool:
@@ -1140,8 +1292,8 @@ index 3467e59e..b2421d46 100644
 +    use_task_rewards = _get(distillation_loss, "use_task_rewards", True)
 +    use_policy_gradient = _get(distillation_loss, "use_policy_gradient", True)
 +    return bool(use_topk and not use_task_rewards and not use_policy_gradient)
-
-
+ 
+ 
  @dataclass
 @@ -135,8 +166,8 @@ def compute_topk_loss(
      - teacher_mass: (bsz, seqlen/cp_size)
@@ -1152,11 +1304,11 @@ index 3467e59e..b2421d46 100644
 +        # FSDP2 and VeOmni use the same top-k loss computation as FSDP1.
 +        case "fsdp" | "fsdp2" | "veomni":
              import verl.trainer.distillation.fsdp.losses as fsdp_losses
-
+ 
              distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
 @@ -205,6 +236,15 @@ def distillation_ppo_loss(
          return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
-
+ 
      # Called as final policy loss
 +    # Normalize every micro-batch against the same global mini-batch, as ppo_loss
 +    # does below. This must happen before distillation_loss: the direct supervised
@@ -1171,13 +1323,13 @@ index 3467e59e..b2421d46 100644
      distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
      if not distillation_loss_config.use_task_rewards and not distillation_loss_config.use_policy_gradient:
 diff --git a/verl/trainer/main_ppo.py b/verl/trainer/main_ppo.py
-index 384f48aa..37b948c9 100644
+index 384f48aa0a63dec0d9adb887a989c88e2335b0ba..37b948c91e6687f4fae4c79f03263e4b6908b0d7 100644
 --- a/verl/trainer/main_ppo.py
 +++ b/verl/trainer/main_ppo.py
 @@ -52,6 +52,7 @@ def run_ppo(config, task_runner_class) -> None:
      if "rl_insight" in ([trainer_logger] if isinstance(trainer_logger, str) else trainer_logger or []):
          os.environ["VERL_RL_INSIGHT_ENABLE"] = "1"
-
+ 
 +    started_local_ray = False
      # Check if Ray is not initialized
      if not ray.is_initialized():
@@ -1241,17 +1393,17 @@ index 384f48aa..37b948c9 100644
 +        # Do not tear down a cluster supplied by an external caller.
 +        if started_local_ray and ray.is_initialized():
 +            ray.shutdown()
-
-
+ 
+ 
  @ray.remote
 diff --git a/verl/trainer/main_ppo_v0.py b/verl/trainer/main_ppo_v0.py
-index ded13904..08fc9450 100644
+index ded139044c257084aa8d1c8726977661a9f55e30..08fc9450b2cfbb5a595966804113df89575b0f35 100644
 --- a/verl/trainer/main_ppo_v0.py
 +++ b/verl/trainer/main_ppo_v0.py
 @@ -21,7 +21,7 @@ import socket
  import ray
  from omegaconf import OmegaConf
-
+ 
 -from verl.trainer.distillation import is_distillation_enabled
 +from verl.trainer.distillation import is_distillation_enabled, is_distillation_only
  from verl.trainer.ppo.ray_trainer import RayPPOTrainer
@@ -1277,9 +1429,9 @@ index ded13904..08fc9450 100644
 +            and not is_distillation_only(config.get("distillation")),
              use_critic=need_critic(config),
          )
-
+ 
 diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
-index 908d36b2..08671144 100644
+index 908d36b2f5470119358db9bd9a20d9b575932de1..086711446081588a55e858dbe4223878686fe155 100644
 --- a/verl/trainer/ppo/ray_trainer.py
 +++ b/verl/trainer/ppo/ray_trainer.py
 @@ -38,7 +38,7 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -1292,14 +1444,14 @@ index 908d36b2..08671144 100644
  from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
  from verl.trainer.ppo.metric_utils import (
 @@ -340,12 +340,20 @@ class RayPPOTrainer:
-
+ 
          self.role_worker_mapping = role_worker_mapping
          self.resource_pool_manager = resource_pool_manager
 -        self.use_reference_policy = need_reference_policy(self.config)
 +        self.distillation_only = is_distillation_only(self.config.get("distillation"))
 +        self.use_reference_policy = need_reference_policy(self.config) and not self.distillation_only
          self.use_teacher_policy = need_teacher_policy(self.config)
-
+ 
 -        self.use_rm = need_reward_model(self.config)
 +        # Pure top-k distillation has no task-reward objective.  A legacy
 +        # launcher may nevertheless have constructed a reward_pool before it
@@ -1309,7 +1461,7 @@ index 908d36b2..08671144 100644
 +        self.use_rm = need_reward_model(self.config) and not self.distillation_only
 +        if self.distillation_only:
 +            self._disable_pure_distillation_reward_resources()
-
+ 
 -        self.use_critic = need_critic(self.config)
 +        self.use_critic = need_critic(self.config) and not self.distillation_only
          self.ray_worker_group_cls = ray_worker_group_cls
@@ -1317,12 +1469,12 @@ index 908d36b2..08671144 100644
          self.validation_generations_logger = ValidationGenerationsLogger(
 @@ -367,10 +375,29 @@ class RayPPOTrainer:
          self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
-
+ 
          self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 -
          self.checkpoint_manager = None
          self._init_dump_executor()
-
+ 
 +    def _disable_pure_distillation_reward_resources(self) -> None:
 +        """Remove legacy reward resources before Ray placement-group creation.
 +
@@ -1360,12 +1512,12 @@ index 908d36b2..08671144 100644
 +            else:
 +                scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
              sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
-
+ 
              reward_extra_infos_to_dump = {
 @@ -593,6 +627,117 @@ class RayPPOTrainer:
          batch_reward = self.reward_loop_manager.compute_rm_score(batch)
          return batch_reward
-
+ 
 +    def _prepare_batch_for_actor(self, batch: DataProto, metrics: dict, timing_raw: dict):
 +        """Run reward/PPO preparation, or bypass it for pure distillation.
 +
@@ -1483,7 +1635,7 @@ index 908d36b2..08671144 100644
 @@ -669,6 +814,20 @@ class RayPPOTrainer:
              sample_inputs.extend(input_texts)
              sample_uids.extend(test_batch.non_tensor_batch["uid"])
-
+ 
 +            if self.distillation_only:
 +                # Pure distillation has no task-reward contract.  Do not call
 +                # extract_reward (which would raise KeyError when rm_scores
@@ -1500,21 +1652,21 @@ index 908d36b2..08671144 100644
 +
              # evaluate using reward_function
              reward_tensor, reward_extra_info = extract_reward(test_batch)
-
+ 
 @@ -690,7 +849,8 @@ class RayPPOTrainer:
-
+ 
              data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
-
+ 
 -        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 +        if not self.distillation_only:
 +            self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
-
+ 
          # dump generations
          val_data_dir = self.config.trainer.get("validation_data_dir", None)
 @@ -707,6 +867,13 @@ class RayPPOTrainer:
          for key_info, lst in reward_extra_infos_dict.items():
              assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
-
+ 
 +        if self.distillation_only:
 +            return {
 +                "val/reward/available": False,
@@ -1527,7 +1679,7 @@ index 908d36b2..08671144 100644
              return {
 @@ -746,6 +913,14 @@ class RayPPOTrainer:
          return metric_dict
-
+ 
      def _merge_validation_results(self, result_a, result_b):
 +        if self.distillation_only:
 +            samples_a = result_a.get("val/samples", 0) if isinstance(result_a, dict) else 0
@@ -1570,7 +1722,7 @@ index 908d36b2..08671144 100644
 @@ -1465,7 +1635,7 @@ class RayPPOTrainer:
                  rollout_n = self.config.actor_rollout_ref.rollout.n
                  gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
-
+ 
 -                if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
 +                if not self.distillation_only and self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                      # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
@@ -1579,7 +1731,7 @@ index 908d36b2..08671144 100644
 @@ -1497,7 +1667,7 @@ class RayPPOTrainer:
                      if "__do_sample__" in gen_batch_output.non_tensor_batch:
                          gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
-
+ 
 -                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
 +                    if not self.distillation_only and self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                          gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)
@@ -1717,7 +1869,7 @@ index 908d36b2..08671144 100644
                          with marked_timer("update_critic", timing_raw, color="pink"):
 @@ -1656,7 +1719,7 @@ class RayPPOTrainer:
                          metrics.update(critic_output_metrics)
-
+ 
                      # implement critic warmup
 -                    if self.config.trainer.critic_warmup > self.global_steps:
 +                    if not self.distillation_only and self.config.trainer.critic_warmup > self.global_steps:
@@ -1747,7 +1899,7 @@ index 908d36b2..08671144 100644
                  gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                  if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
 diff --git a/verl/trainer/ppo/v1/agent_loop_tq.py b/verl/trainer/ppo/v1/agent_loop_tq.py
-index 5e147eef..f2f16585 100644
+index 5e147eef223f65e9ca72f86d11a933af44daa00c..f2f165856e1927513fa7c2e09e4b721c3da050f5 100644
 --- a/verl/trainer/ppo/v1/agent_loop_tq.py
 +++ b/verl/trainer/ppo/v1/agent_loop_tq.py
 @@ -31,6 +31,7 @@ from verl.experimental.agent_loop import (
@@ -1757,11 +1909,11 @@ index 5e147eef..f2f16585 100644
 +from verl.trainer.distillation import is_distillation_only
  from verl.utils.ray_utils import auto_await
  from verl.utils.tensordict_utils import list_of_dict_to_tensordict
-
+ 
 @@ -38,6 +39,33 @@ logger = logging.getLogger(__name__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
-
-
+ 
+ 
 +def _validate_teacher_output_for_tq(
 +    output: AgentLoopOutput,
 +    *,
@@ -1795,7 +1947,7 @@ index 5e147eef..f2f16585 100644
 @@ -137,7 +165,13 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
              logger.warning(f"Empty output for prompt {uid}_{session_id}")
              return
-
+ 
 -        await self._compute_score(outputs, kwargs=kwargs)
 +        distillation_only = getattr(
 +            self,
@@ -1804,7 +1956,7 @@ index 5e147eef..f2f16585 100644
 +        )
 +        if not distillation_only:
 +            await self._compute_score(outputs, kwargs=kwargs)
-
+ 
          final_output = outputs[-1]
          # TODO: Support output:list[AgentLoopOutput]
 @@ -148,6 +182,17 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
@@ -1822,17 +1974,17 @@ index 5e147eef..f2f16585 100644
 +                    self.distillation_config.teacher_image_key
 +                ),
 +            )
-
+ 
          if final_output.reward_score is not None:
              for output in outputs[:-1]:
 diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
-index e07b8166..d7c950a3 100644
+index e07b816669b68667a92e0462ec89d26ecd6bd2e5..d7c950a36c30bc8e6ba2378d34977e4e54de426c 100644
 --- a/verl/trainer/ppo/v1/trainer_base.py
 +++ b/verl/trainer/ppo/v1/trainer_base.py
 @@ -12,6 +12,7 @@
  # See the License for the specific language governing permissions and
  # limitations under the License.
-
+ 
 +import hashlib
  import json
  import logging
@@ -1855,8 +2007,8 @@ index e07b8166..d7c950a3 100644
  from verl.trainer.ppo.metric_utils import (
 @@ -104,6 +106,37 @@ logger = logging.getLogger(__name__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
-
-
+ 
+ 
 +def _normalize_explicit_save_steps(value: Any, total_training_steps: int) -> frozenset[int]:
 +    """Validate optional exact checkpoint steps used by the v1 trainer.
 +
@@ -1893,8 +2045,8 @@ index e07b8166..d7c950a3 100644
      try:
 @@ -117,6 +150,189 @@ def _tq_supports_checkpoint() -> bool:
      )
-
-
+ 
+ 
 +def _fsync_directory(path: str) -> None:
 +    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
 +    try:
@@ -2080,9 +2232,9 @@ index e07b8166..d7c950a3 100644
 +
  class PPOTrainer(ABC):
      """Base class for PPO trainer.
-
+ 
 @@ -126,8 +342,9 @@ class PPOTrainer(ABC):
-
+ 
      def __init__(self, config: DictConfig):
          self.config = config
 -        self.use_critic = need_critic(self.config)
@@ -2096,7 +2248,7 @@ index e07b8166..d7c950a3 100644
 @@ -246,6 +463,25 @@ class PPOTrainer(ABC):
              all_wg.update(spawn_wg)
              logger.info(f"create worker group {spawn_wg.keys()}")
-
+ 
 +        self.actor_rollout_wg = all_wg[str(actor_role)]
 +        deferred_teacher_servers = False
 +        if self.config.trainer.get("require_role_gpu_partition", False):
@@ -2121,12 +2273,12 @@ index e07b8166..d7c950a3 100644
              self.critic_wg = all_wg[str(Role.Critic)]
 @@ -255,7 +491,6 @@ class PPOTrainer(ABC):
              logger.info("critic model engine initialized")
-
+ 
          # 6. initialize actor and ref model engine
 -        self.actor_rollout_wg = all_wg[str(actor_role)]
          self.actor_rollout_wg.init_model()
          logger.info("actor and ref model engine initialized")
-
+ 
 @@ -272,7 +507,7 @@ class PPOTrainer(ABC):
          # 7. initialize reward loop manager
          resource_pool = (
@@ -2137,7 +2289,7 @@ index e07b8166..d7c950a3 100644
          )
          self.reward_loop_manager = RewardLoopManager(
 @@ -283,12 +518,15 @@ class PPOTrainer(ABC):
-
+ 
          # 8. initialize teacher loop manager
          if self.use_teacher_policy:
 -            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
@@ -2159,18 +2311,18 @@ index e07b8166..d7c950a3 100644
              self.teacher_model_manager = None
              self.distillation_config = None
 @@ -328,6 +566,8 @@ class PPOTrainer(ABC):
-
+ 
      def get_reward_handles(self) -> list[ray.actor.ActorHandle]:
          """Get the handles of reward loop workers."""
 +        if self.distillation_only:
 +            return None
          return self.reward_loop_manager.reward_loop_worker_handles
-
+ 
      def fit(self, agent_loop_manager: AgentLoopManager):
 @@ -352,96 +592,121 @@ class PPOTrainer(ABC):
              experiment_name=self.config.trainer.experiment_name,
          )
-
+ 
 -        # perform validation before training
 -        if self.config.trainer.get("val_before_train", True):
 -            self.on_validate_begin()
@@ -2240,7 +2392,7 @@ index e07b8166..d7c950a3 100644
 +            if explicit_save_steps:
 +                logger.info("Exact checkpoint steps enabled: %s", sorted(explicit_save_steps))
 +            progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
-
+ 
 -                self.on_step_end()
 -                metrics.update(self._consume_sync_metrics())
 +            # we start from step 1
@@ -2266,7 +2418,7 @@ index e07b8166..d7c950a3 100644
 +                )
 +                metrics = {}
 +                self.timing_raw = {}
-
+ 
 -            # 4. validate
 -            if self.config.trainer.test_freq > 0 and (
 -                is_last_step or self.global_steps % self.config.trainer.test_freq == 0
@@ -2281,20 +2433,20 @@ index e07b8166..d7c950a3 100644
 +                # 1. perform rollout and actor/critic training
 +                with marked_timer("step", self.timing_raw):
 +                    self.on_step_begin()
-
+ 
 -            # 5. record metrics
 -            self._compute_metrics(batch, metrics, self.timing_raw, global_steps=self.global_steps, epoch=current_epoch)
 +                    self._start_profiling()
 +                    batch = self.step(metrics, self.timing_raw)
 +                    self._stop_profiling()
-
+ 
 -            # 6. dump rollout generations if enabled
 -            rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
 -            if rollout_data_dir:
 -                self._log_rollout_data(batch, self.timing_raw, rollout_data_dir)
 +                    self.on_step_end()
 +                    metrics.update(self._consume_sync_metrics())
-
+ 
 -            # 7. cleanup transfer queue
 -            tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
 +                # 2. validate
@@ -2333,7 +2485,7 @@ index e07b8166..d7c950a3 100644
 +                        self.logger.finish()
 +                    with marked_timer("save_checkpoint", self.timing_raw, color="green"):
 +                        self._save_checkpoint()
-
+ 
 -            self.logger.log(data=metrics, step=self.global_steps)
 -            progress_bar.update(1)
 -            self.global_steps += 1
@@ -2369,13 +2521,13 @@ index e07b8166..d7c950a3 100644
 +                finally:
 +                    if progress_bar is not None:
 +                        progress_bar.close()
-
+ 
      def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
          train_batch_size = self.config.data.train_batch_size
 @@ -485,8 +750,11 @@ class PPOTrainer(ABC):
              batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
              self.on_sample_end()
-
+ 
 +        if self.distillation_only and len(batch) == 0:
 +            raise RuntimeError("Pure distillation received no completed rollout outputs")
 +
@@ -2384,66 +2536,66 @@ index e07b8166..d7c950a3 100644
 +        if not self.distillation_only and self.reward_loop_manager.reward_loop_worker_handles is None:
              with marked_timer("reward", timing_raw, color="yellow"):
                  batch = self._compute_reward_colocate(batch, metrics=metrics)
-
+ 
 @@ -494,30 +762,32 @@ class PPOTrainer(ABC):
          batch = self._balance_batch(batch, metrics=metrics)
-
+ 
          # 4. compute old_log_prob
 -        with marked_timer("old_log_prob", timing_raw, color="blue"):
 -            batch = self._compute_old_log_prob(batch, metrics=metrics)
 +        if not self.distillation_only:
 +            with marked_timer("old_log_prob", timing_raw, color="blue"):
 +                batch = self._compute_old_log_prob(batch, metrics=metrics)
-
+ 
          # 5. [OPTIONAL] compute ref_log_prob
 -        if self.use_reference_policy:
 +        if self.use_reference_policy and not self.distillation_only:
              with marked_timer("ref", timing_raw, color="olive"):
                  batch = self._compute_ref_log_prob(batch, metrics=metrics)
-
+ 
          # 6. [OPTIONAL] compute critic values
 -        if self.use_critic:
 +        if self.use_critic and not self.distillation_only:
              with marked_timer("values", timing_raw, color="cyan"):
                  batch = self._compute_values(batch, metrics=metrics)
-
+ 
          # 7. compute advantage and return
 -        with marked_timer("adv", timing_raw, color="brown"):
 -            batch = self._compute_advantage(batch, metrics=metrics)
 +        if not self.distillation_only:
 +            with marked_timer("adv", timing_raw, color="brown"):
 +                batch = self._compute_advantage(batch, metrics=metrics)
-
+ 
          # 8. [OPTIONAL] update critic
 -        if self.use_critic:
 +        if self.use_critic and not self.distillation_only:
              with marked_timer("update_critic", timing_raw, color="pink"):
                  batch = self._update_critic(batch, metrics=metrics)
-
+ 
          # 9. update actor
 -        if self.config.trainer.critic_warmup <= self.global_steps:
 +        if self.distillation_only or self.config.trainer.critic_warmup <= self.global_steps:
              with marked_timer("update_actor", timing_raw, color="red"):
                  batch = self._update_actor(batch, metrics=metrics)
-
+ 
 @@ -686,12 +956,12 @@ class PPOTrainer(ABC):
              lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
          ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
-
+ 
 -        role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
 +        role = Role.ActorRolloutRef if self.use_reference_policy and not ref_in_actor else Role.ActorRollout
          self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
          self.mapping[role] = "global_pool"
-
+ 
          # Add critic worker to mapping.
 -        if need_critic(config):
 +        if self.use_critic:
              self.role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
              self.mapping[Role.Critic] = "global_pool"
-
+ 
 @@ -702,7 +972,7 @@ class PPOTrainer(ABC):
          }
-
+ 
          # Add separate resource pool for reward model if enabled
 -        if config.reward.reward_model.enable_resource_pool:
 +        if not self.distillation_only and config.reward.reward_model.enable_resource_pool:
@@ -2462,7 +2614,7 @@ index e07b8166..d7c950a3 100644
 @@ -758,6 +1028,26 @@ class PPOTrainer(ABC):
          self.global_steps = int(global_step_folder.split("global_step_")[-1])
          logger.info(f"Resuming from {global_step_folder}, setting global step to {self.global_steps}")
-
+ 
 +        require_atomic_checkpoint = self.config.trainer.get("require_atomic_checkpoint", False)
 +        if require_atomic_checkpoint:
 +            completion_path = os.path.join(global_step_folder, "checkpoint_complete.json")
@@ -2494,11 +2646,11 @@ index e07b8166..d7c950a3 100644
 +            raise RuntimeError(f"Required dataloader state is missing: {dataloader_local_path}")
          else:
              logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
-
+ 
 @@ -873,10 +1165,11 @@ class PPOTrainer(ABC):
                  critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
              )
-
+ 
 -        # save dataloader state
 +        # Save dataloader state atomically. The completion marker and tracker
 +        # below are never visible before this replacement has been fsynced.
@@ -2506,13 +2658,13 @@ index e07b8166..d7c950a3 100644
          dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
 -        torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
 +        _atomic_torch_save(self.train_dataloader.state_dict(), dataloader_local_path)
-
+ 
          # save TransferQueue state for async modes so in-flight prompts (already fetched from the
          # dataloader but not yet trained into this checkpoint's weights) survive a restart:
 @@ -888,16 +1181,43 @@ class PPOTrainer(ABC):
                  metadata={"global_steps": self.global_steps},
              )
-
+ 
 -        # write latest checkpointed iteration tracker for atomic resume
 +        # Async checkpoint implementations own their publication protocol.
          actor_ckpt_cfg = self.config.actor_rollout_ref.actor.get("checkpoint", {})
@@ -2554,12 +2706,12 @@ index e07b8166..d7c950a3 100644
 -        with open(local_latest_checkpointed_iteration, "w") as f:
 -            f.write(str(self.global_steps))
 +        _atomic_write_bytes(local_latest_checkpointed_iteration, f"{self.global_steps}\n".encode("ascii"))
-
+ 
      def _validate(self) -> dict[str, float]:
          # Lists to collect samples for the table
 @@ -936,7 +1256,7 @@ class PPOTrainer(ABC):
              )
-
+ 
              # 3. [OPTIONAL] compute reward score with colocated reward model
 -            if self.reward_loop_manager.reward_loop_worker_handles is None:
 +            if not self.distillation_only and self.reward_loop_manager.reward_loop_worker_handles is None:
@@ -2569,13 +2721,13 @@ index e07b8166..d7c950a3 100644
 @@ -970,21 +1290,28 @@ class PPOTrainer(ABC):
              all_inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["prompts"]]
              all_outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["responses"]]
-
+ 
 -            fields = ["uid", "rm_scores", "num_turns", "reward_model", "data_source", "extra_fields"]
 +            fields = ["uid", "num_turns", "reward_model", "data_source", "extra_fields"]
 +            if not self.distillation_only:
 +                fields.insert(1, "rm_scores")
              data = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=fields)
-
+ 
              sample_uids.extend(data.pop("uid").tolist())
              sample_outputs.extend(all_outputs[i] for i in final_indices)
              sample_inputs.extend(all_inputs[i] for i in final_indices)
@@ -2589,7 +2741,7 @@ index e07b8166..d7c950a3 100644
 -            reward_extra_infos_dict["reward"].extend(scores)
 +            if not self.distillation_only:
 +                reward_extra_infos_dict["reward"].extend(scores)
-
+ 
              extra_fields_list = data.pop("extra_fields", None)
              if extra_fields_list is not None:
 -                n_prior = len(reward_extra_infos_dict["reward"]) - len(extra_fields_list.tolist())
@@ -2603,7 +2755,7 @@ index e07b8166..d7c950a3 100644
 @@ -997,6 +1324,9 @@ class PPOTrainer(ABC):
                          reward_extra_infos_dict[key].append(value)
                      n_prior += 1
-
+ 
 +            if self.distillation_only:
 +                reward_extra_infos_dict["reward_status"].extend(["unavailable"] * len(final_indices))
 +
@@ -2612,18 +2764,18 @@ index e07b8166..d7c950a3 100644
                  sample_gts.extend([item.get("ground_truth", None) for item in reward_model.tolist()])
 @@ -1017,7 +1347,8 @@ class PPOTrainer(ABC):
              tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
-
+ 
          # logger to wandb
 -        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 +        if not self.distillation_only:
 +            self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
-
+ 
          # dump to local dir
          val_data_dir = self.config.trainer.get("validation_data_dir", None)
 @@ -1052,6 +1383,12 @@ class PPOTrainer(ABC):
                  dump_path=val_data_dir,
              )
-
+ 
 +        if self.distillation_only:
 +            return {
 +                "val/reward/available": False,
@@ -2631,12 +2783,12 @@ index e07b8166..d7c950a3 100644
 +                "val/samples": len(sample_scores),
 +            }
          return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
-
+ 
      def _maybe_log_val_generations(self, inputs, outputs, scores):
 @@ -1104,10 +1441,22 @@ class PPOTrainer(ABC):
                  return obj.tolist()
              raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
-
+ 
 -        with open(filename, "w") as f:
 -            for i in range(n):
 -                entry = {k: v[i] for k, v in base_data.items()}
@@ -2657,9 +2809,9 @@ index e07b8166..d7c950a3 100644
 +        finally:
 +            if os.path.exists(temporary):
 +                os.unlink(temporary)
-
+ 
          print(f"Dumped generations to {filename}")
-
+ 
 @@ -1138,33 +1487,76 @@ class PPOTrainer(ABC):
          """Create or recreate the dump executor and futures list."""
          self._dump_executor = ThreadPoolExecutor(max_workers=1)
@@ -2671,7 +2823,7 @@ index e07b8166..d7c950a3 100644
 +        for future in self._dump_futures:
 +            future.result()
 +        self._dump_futures.clear()
-
+ 
      def _shutdown_dump_executor(self):
          """Drain pending dump futures and shut down the executor."""
 -        for f in self._dump_futures:
@@ -2685,7 +2837,7 @@ index e07b8166..d7c950a3 100644
 +        finally:
 +            self._dump_executor.shutdown(wait=True)
 +            self._dump_executor_closed = True
-
+ 
      def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
          """Fetch rollout data from TransferQueue and dump sorted by uid."""
          with marked_timer("dump_rollout_generations", timing_raw, color="green"):
@@ -2696,7 +2848,7 @@ index e07b8166..d7c950a3 100644
              data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
              data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
              data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
-
+ 
 -            uids = data.pop("uid").tolist()
 +            uids = _normalize_tq_non_tensor_sequence(data.pop("uid"))
 +            if len(uids) != len(batch.keys):
@@ -2711,7 +2863,7 @@ index e07b8166..d7c950a3 100644
 +                scores = data.pop("rm_scores").sum(dim=1).tolist()
 +            else:
 +                scores = [None] * len(uids) if self.distillation_only else [0.0] * len(uids)
-
+ 
              reward_model = data.pop("reward_model", None)
              if reward_model is not None:
 -                gts = [item.get("ground_truth", None) for item in reward_model.tolist()]
@@ -2727,7 +2879,7 @@ index e07b8166..d7c950a3 100644
 +                ]
              else:
                  gts = [None] * len(uids)
-
+ 
 +            extra_fields = data.pop("extra_fields", None)
 +            if extra_fields is None:
 +                teacher_input_evidence = [None] * len(uids)
@@ -2750,7 +2902,7 @@ index e07b8166..d7c950a3 100644
              gts = [gts[i] for i in sorted_indices]
              scores = [scores[i] for i in sorted_indices]
 +            teacher_input_evidence = [teacher_input_evidence[i] for i in sorted_indices]
-
+ 
 -            reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
 +            reward_extra_infos_dict = {
 +                "uid": [batch.keys[i] for i in sorted_indices],
@@ -2758,7 +2910,7 @@ index e07b8166..d7c950a3 100644
 +            }
 +            if self.distillation_only:
 +                reward_extra_infos_dict["reward_status"] = ["unavailable"] * len(uids)
-
+ 
              self._dump_generations(
                  inputs=inputs,
 @@ -1624,18 +2022,10 @@ class PPOTrainer(ABC):
@@ -2815,7 +2967,7 @@ index e07b8166..d7c950a3 100644
              keys=batch.keys,
 @@ -1705,9 +2098,10 @@ class PPOTrainer(ABC):
                  spec_verifies = [extra_field["spec_num_verify_steps"] for extra_field in extra_fields]
-
+ 
          data = data.to_padded_tensor()
 -        data["token_level_scores"] = data["rm_scores"]
 -        if "token_level_rewards" not in data:
@@ -2848,7 +3000,7 @@ index e07b8166..d7c950a3 100644
          n_gpus = self._get_n_gpus_for_throughput()
          metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 diff --git a/verl/trainer/sft_trainer.py b/verl/trainer/sft_trainer.py
-index 0c4aa8e0..e391a543 100644
+index 0c4aa8e08d8efdad1e9953f64f48fb0ba5f30b31..e391a5438fe627a51dcd0f7d79bc4466fc557021 100644
 --- a/verl/trainer/sft_trainer.py
 +++ b/verl/trainer/sft_trainer.py
 @@ -190,6 +190,15 @@ class SFTTrainer:
@@ -2864,13 +3016,13 @@ index 0c4aa8e0..e391a543 100644
 +                raise ValueError("trainer.save_steps must contain integer steps") from exc
 +            if any(step < 1 or step > self.total_training_steps for step in self.save_steps):
 +                raise ValueError("trainer.save_steps must be within the configured training horizon")
-
+ 
          self.test_freq = self.config.trainer.test_freq
          if self.test_freq == "after_each_epoch":
 @@ -233,8 +242,12 @@ class SFTTrainer:
          dp_rank = self.engine.get_data_parallel_rank()
          dp_size = self.engine.get_data_parallel_size()
-
+ 
 +        # Versioned datasets may pre-arrange examples into global length buckets.
 +        # In that case preserving dataset order lets every DP rank receive the
 +        # corresponding slice of the same bucketed global batch.
@@ -2879,30 +3031,30 @@ index 0c4aa8e0..e391a543 100644
 -            self.train_dataset, shuffle=True, num_replicas=dp_size, rank=dp_rank, drop_last=True
 +            self.train_dataset, shuffle=train_shuffle, num_replicas=dp_size, rank=dp_rank, drop_last=True
          )
-
+ 
          self.global_batch_size = config.data.train_batch_size
 @@ -410,7 +423,9 @@ class SFTTrainer:
-
+ 
                  is_last_step = global_step >= self.total_training_steps
                  is_valid_step = global_step % self.test_freq == 0
 -                is_save_step = global_step % self.save_freq == 0
 +                is_save_step = global_step in self.save_steps or (
 +                    not self.save_steps and self.save_freq > 0 and global_step % self.save_freq == 0
 +                )
-
+ 
                  # early exit or validation step
                  if is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step):
 @@ -437,7 +452,7 @@ class SFTTrainer:
                          last_valid_metric = metric
                      torch.distributed.barrier()
-
+ 
 -                if is_last_step or (self.save_freq > 0 and is_save_step):
 +                if is_last_step or is_save_step:
                      aggressive_empty_cache(force_sync=True)
                      self.ckpt_handler.save_checkpoint(step=global_step)
-
+ 
 diff --git a/verl/utils/checkpoint/fsdp_checkpoint_manager.py b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
-index 448ab201..3a168ae6 100644
+index 448ab201872493ebfa36c2262670d125c61ecfb4..3a168ae65a38ab6dff8d6609862610ea2238962f 100644
 --- a/verl/utils/checkpoint/fsdp_checkpoint_manager.py
 +++ b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
 @@ -15,6 +15,8 @@
@@ -2917,7 +3069,7 @@ index 448ab201..3a168ae6 100644
 @@ -40,6 +42,145 @@ from .checkpoint_manager import BaseCheckpointManager
  logger = logging.getLogger(__file__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
-
+ 
 +_VISUAL_PROCESSOR_METADATA_FILENAMES = (
 +    "preprocessor_config.json",
 +    "video_preprocessor_config.json",
@@ -3057,7 +3209,7 @@ index 448ab201..3a168ae6 100644
 +
 +    return tuple(copied)
 +
-
+ 
  @dataclass
  class FSDPConfig:
 @@ -338,12 +479,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
@@ -3099,13 +3251,13 @@ index 448ab201..3a168ae6 100644
 +                    logger=logger,
 +                    log_only_rank_0=True,
 +                )
-
+ 
              # If we have a custom model, we copy the file defining it in the folder and set the attributes so it can be
              # loaded from the Hub.
 @@ -420,7 +575,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
-
+ 
                  drop_tied_target_keys(state_dict, save_model, model_config)
-
+ 
 -                save_model.save_pretrained(hf_local_path, state_dict=state_dict)
 +                # ``state_dict`` comes directly from the current FSDP model and
 +                # therefore already uses current Transformers parameter names.
@@ -3121,7 +3273,7 @@ index 448ab201..3a168ae6 100644
                      f"Saved hf_model to {os.path.abspath(hf_local_path)}",
                      rank=self.rank,
 diff --git a/verl/utils/tensordict_utils.py b/verl/utils/tensordict_utils.py
-index 91d82b15..ac8e274e 100644
+index 91d82b15ffd7990c5e50107f3882d83f1558c604..ac8e274e09d0d96f7416c65398d9ea2be39527e0 100644
 --- a/verl/utils/tensordict_utils.py
 +++ b/verl/utils/tensordict_utils.py
 @@ -357,12 +357,14 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
@@ -3141,11 +3293,11 @@ index 91d82b15..ac8e274e 100644
 +                ]
 +                chunk_td[key] = nested_tensor_from_tensor_list(chunk_tensors, ragged_idx=ragged_idx)
              continue
-
+ 
          for i, chunk_td in enumerate(tds):
 @@ -908,11 +910,98 @@ def contiguous(data: TensorDict) -> TensorDict:
-
-
+ 
+ 
  def maybe_fix_3d_position_ids(data: TensorDict):
 -    # note for tensordict with pickle/unpickle. nested tensor in tensordict after consolidate and pickle/unpickle
 -    # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
@@ -3244,11 +3396,11 @@ index 91d82b15..ac8e274e 100644
 +    repaired._ragged_idx = 2
 +    with data.unlock_():
 +        data["position_ids"] = repaired
-
-
+ 
+ 
  def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDict:
 diff --git a/verl/utils/tracking.py b/verl/utils/tracking.py
-index e7c9ff27..4facdf18 100644
+index e7c9ff273902bd753ed41136c29a6992a679791b..4facdf18fef5704a4995d50bf2d8fcfa7d7b725b 100644
 --- a/verl/utils/tracking.py
 +++ b/verl/utils/tracking.py
 @@ -22,6 +22,7 @@ import os
@@ -3258,10 +3410,10 @@ index e7c9ff27..4facdf18 100644
 +from numbers import Number
  from pathlib import Path
  from typing import Any
-
+ 
 @@ -58,6 +59,10 @@ class Tracking:
      ]
-
+ 
      def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
 +        # Initialize lifecycle state before importing any optional backend so a
 +        # partially constructed Tracking object is still safe to finalize.
@@ -3279,17 +3431,17 @@ index e7c9ff27..4facdf18 100644
 -
          if "tracking" in default_backend or "wandb" in default_backend:
              import os
-
+ 
 @@ -186,27 +188,68 @@ class Tracking:
              self.logger["rl_insight"] = RLInsightLogger(project_name, experiment_name, config)
-
+ 
      def log(self, data, step, backend=None):
 +        if self._finished:
 +            raise RuntimeError("Cannot log through a finished Tracking instance")
          for default_backend, logger_instance in self.logger.items():
              if backend is None or default_backend in backend:
                  logger_instance.log(data=data, step=step)
-
+ 
 -    def __del__(self):
 +    def flush(self):
 +        """Synchronously flush backends which expose an explicit flush hook."""
@@ -3355,15 +3507,15 @@ index e7c9ff27..4facdf18 100644
 +            # Exceptions raised from __del__ are unraisable and obscure the
 +            # original failure. Explicit training-path finish() still raises.
 +            pass
-
-
+ 
+ 
  class RLInsightLogger:
 @@ -437,13 +480,47 @@ class _TensorboardAdapter:
          os.makedirs(tensorboard_dir, exist_ok=True)
          print(f"Saving tensorboard log to {tensorboard_dir}.")
          self.writer = SummaryWriter(tensorboard_dir)
 +        self._finished = False
-
+ 
      def log(self, data, step):
 -        for key in data:
 -            self.writer.add_scalar(key, data[key], step)
@@ -3399,18 +3551,18 @@ index e7c9ff27..4facdf18 100644
 +    def flush(self):
 +        if not self._finished:
 +            self.writer.flush()
-
+ 
      def finish(self):
 -        self.writer.close()
 +        if not self._finished:
 +            self.writer.flush()
 +            self.writer.close()
 +            self._finished = True
-
-
+ 
+ 
  class _MlflowLoggingAdapter:
 diff --git a/verl/workers/config/distillation.py b/verl/workers/config/distillation.py
-index b58f8bcc..e6ec326e 100644
+index b58f8bccffd0d3efaaec0a351f0288de7d857818..e6ec326ec758bedaac774b590223e0447dfb090a 100644
 --- a/verl/workers/config/distillation.py
 +++ b/verl/workers/config/distillation.py
 @@ -233,6 +233,15 @@ class DistillationConfig(BaseConfig):
@@ -3428,7 +3580,7 @@ index b58f8bcc..e6ec326e 100644
 +        this is false.
      distillation_loss (DistillationLossConfig):
      Configuration for distillation loss settings.
-
+ 
 @@ -264,9 +273,22 @@ class DistillationConfig(BaseConfig):
      nnodes: int = 0
      teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
@@ -3436,7 +3588,7 @@ index b58f8bcc..e6ec326e 100644
 +    teacher_image_key: Optional[str] = None
 +    fallback_to_student_images: bool = False
      distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
-
+ 
      def __post_init__(self):
 +        if self.teacher_image_key is not None:
 +            if (
@@ -3451,9 +3603,9 @@ index b58f8bcc..e6ec326e 100644
 +            raise ValueError("fallback_to_student_images requires teacher_image_key to be set.")
          if not self.enabled:
              return
-
+ 
 diff --git a/verl/workers/engine/automodel/transformer_impl.py b/verl/workers/engine/automodel/transformer_impl.py
-index dc917176..2a00583b 100644
+index dc9171761e6d258c290d27f24bbb7f251d6b2283..2a00583b84bd0824a3007d33076a0d2909b9a0a2 100644
 --- a/verl/workers/engine/automodel/transformer_impl.py
 +++ b/verl/workers/engine/automodel/transformer_impl.py
 @@ -47,6 +47,7 @@ from verl.utils.device import get_device_id, get_device_name
@@ -3461,11 +3613,11 @@ index dc917176..2a00583b 100644
  from verl.utils.torch_functional import logprobs_from_logits
  from verl.workers.config import AutomodelEngineConfig, AutomodelOptimizerConfig, HFModelConfig
 +from verl.workers.utils.padding import pack_position_ids
-
+ 
  from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
  from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
 @@ -504,10 +505,7 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
-
+ 
              if pad_mode == DatasetPadMode.NO_PADDING:
                  input_ids_rmpad = input_ids.values().unsqueeze(0)
 -                if position_ids.dim() == 3:
@@ -3475,9 +3627,9 @@ index dc917176..2a00583b 100644
 +                position_ids_rmpad = pack_position_ids(position_ids, total_tokens=input_ids_rmpad.shape[-1])
              else:
                  raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
-
+ 
 diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
-index fa06a85a..ae278426 100644
+index fa06a85a7c76d90f48a168007e61515b60bcea96..ae27842697054c9197c8fe90d9536faf4228a223 100644
 --- a/verl/workers/engine/fsdp/transformer_impl.py
 +++ b/verl/workers/engine/fsdp/transformer_impl.py
 @@ -71,7 +71,7 @@ from verl.utils.ulysses import (
@@ -3486,7 +3638,7 @@ index fa06a85a..ae278426 100644
  from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
 -from verl.workers.utils.padding import build_attention_mask_from_nested
 +from verl.workers.utils.padding import build_attention_mask_from_nested, pack_position_ids
-
+ 
  from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
  from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
 @@ -1097,10 +1097,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
@@ -3500,14 +3652,14 @@ index fa06a85a..ae278426 100644
 +                position_ids_rmpad = pack_position_ids(position_ids, total_tokens=input_ids_rmpad.shape[-1])
              else:
                  raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
-
+ 
 diff --git a/verl/workers/rollout/replica.py b/verl/workers/rollout/replica.py
-index 22bb8667..72ea1edd 100644
+index 22bb8667c11184904ecbb952a6929c7acd55bc72..72ea1edda46ebf81ea68a883ff0e43a97673e302 100644
 --- a/verl/workers/rollout/replica.py
 +++ b/verl/workers/rollout/replica.py
 @@ -157,13 +157,8 @@ class RolloutReplica(ABC):
          await self.launch_servers()
-
+ 
      # TODO(sgm): this should be the default solution, but need to make the RolloutMode more clear.
 -    async def init_colocated(self, resource_pool: RayResourcePool):
 -        """Init colocated rollout server, rollout engine and hybrid engine colocated in same ray placement group
@@ -3530,16 +3682,251 @@ index 22bb8667..72ea1edd 100644
 +        """Init colocated rollout workers and then start their model server."""
 +        await self.prepare_colocated(resource_pool)
          await self.launch_servers()
-
+ 
      async def init_standalone(self):
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index 7e3102adbcd1dcc53d0dd92ee368a55dc543237b..ae0ec87b814dba1df97c3a60a4dda966dd1dc178 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -12,8 +12,10 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ import ctypes
++import inspect
+ import json
+ import logging
++import math
+ import os
+ import platform
+ import signal
+@@ -374,13 +376,34 @@ class vLLMColocateWorkerExtension:
+             return False
+ 
+         # Platform workers without the layerwise reload API (e.g. vllm-ascend's
+-        # NPUWorker) fall back to bucketed load_weights.
+-        if not callable(getattr(self, "reload_weights", None)):
++        # NPUWorker), as well as vLLM releases whose reload_weights() only
++        # reloads from the original checkpoint, fall back to bucketed
++        # load_weights.
++        reload_weights = getattr(self, "reload_weights", None)
++        if not callable(reload_weights):
++            return False
++
++        try:
++            parameters = inspect.signature(reload_weights).parameters
++        except (TypeError, ValueError):
++            return False
++
++        supports_arbitrary_keywords = any(
++            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
++        )
++        supported_keyword_kinds = {
++            inspect.Parameter.POSITIONAL_OR_KEYWORD,
++            inspect.Parameter.KEYWORD_ONLY,
++        }
++        required_keywords = {"weights_iterator", "is_checkpoint_format"}
++        if not supports_arbitrary_keywords and any(
++            name not in parameters or parameters[name].kind not in supported_keyword_kinds for name in required_keywords
++        ):
+             return False
+ 
+         logger.info("Loading standard weights via vLLM reload_weights (async)")
+         with set_current_vllm_config(self.model_runner.vllm_config):
+-            self.reload_weights(
++            reload_weights(
+                 weights_iterator=self._iter_normalized_base_sync_weights(receiver.iter_weights(), clone_tensors=True),
+                 is_checkpoint_format=True,
+             )
+@@ -642,37 +665,144 @@ def build_mtp_speculative_config(
+     }
+ 
+ 
+-def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional[int], result_dict: dict[str, list]):
+-    """Extract prompt log probabilities from generation output."""
++def extract_prompt_logprobs(
++    output: RequestOutput,
++    num_prompt_logprobs: Optional[int],
++    result_dict: dict[str, list],
++    vocab_size: Optional[int] = None,
++) -> None:
++    """Extract a complete prompt top-k distribution from a vLLM output.
++
++    Every real prompt position must contain ranks ``1..K`` exactly once.  We
++    deliberately reject incomplete or sentinel-corrupted rows instead of
++    padding them: padding would either create fake probability mass after the
++    loss clamp or produce ``0 * -inf`` NaNs when the clamp is disabled.  The
++    only dummy row is the terminal row appended for the final prompt token;
++    downstream response masking excludes it from the distillation loss.
++    """
+     if num_prompt_logprobs is None:
+         return
++    if isinstance(num_prompt_logprobs, bool) or not isinstance(num_prompt_logprobs, int):
++        raise TypeError("num_prompt_logprobs must be a non-negative integer or None")
++    if num_prompt_logprobs < 0:
++        raise ValueError(f"num_prompt_logprobs must be non-negative, got {num_prompt_logprobs}")
++
++    raw_prompt_logprobs = getattr(output, "prompt_logprobs", None)
++    if raw_prompt_logprobs is None:
++        raise ValueError("vLLM output has no prompt_logprobs")
++    if not isinstance(raw_prompt_logprobs, (list, tuple)):
++        raise TypeError("vLLM prompt_logprobs must be a list or tuple")
++    if not raw_prompt_logprobs:
++        raise ValueError("vLLM output has an empty prompt_logprobs sequence")
++
++    if vocab_size is not None:
++        if isinstance(vocab_size, bool) or not isinstance(vocab_size, int):
++            raise TypeError("vocab_size must be a positive integer or None")
++        if vocab_size <= 0:
++            raise ValueError(f"vocab_size must be positive, got {vocab_size}")
++
++    width = max(num_prompt_logprobs, 1)
++    prompt_logprobs_ls: list[list[float]] = []
++    prompt_ids_ls: list[list[int]] = []
++
++    def _parse_token_id(value: Any) -> int:
++        if isinstance(value, bool):
++            raise TypeError("vLLM prompt token id must be an integer, not bool")
++        if isinstance(value, int):
++            parsed = value
++        elif isinstance(value, str):
++            try:
++                parsed = int(value.strip())
++            except (TypeError, ValueError, OverflowError) as exc:
++                raise TypeError(f"vLLM prompt token id is not an integer: {value!r}") from exc
++        else:
++            raise TypeError(f"vLLM prompt token id must be an integer, got {type(value).__name__}")
++        if parsed < 0:
++            raise ValueError(f"vLLM returned negative/sentinel prompt token id {parsed}")
++        if parsed > 2**31 - 1:
++            raise ValueError(f"vLLM prompt token id {parsed} does not fit torch.int32")
++        if vocab_size is not None and parsed >= vocab_size:
++            raise ValueError(f"vLLM prompt token id {parsed} is outside vocabulary size {vocab_size}")
++        return parsed
++
++    def _parse_rank(value: Any) -> int:
++        if isinstance(value, bool) or not isinstance(value, int):
++            raise TypeError(f"vLLM prompt logprob rank must be an integer, got {value!r}")
++        if value < 1:
++            raise ValueError(f"vLLM prompt logprob rank must be >= 1, got {value}")
++        return value
++
++    def _parse_logprob(token_logprob: Any) -> float:
++        try:
++            value = token_logprob.logprob
++        except AttributeError as exc:
++            raise TypeError("vLLM prompt logprob entries must expose a logprob attribute") from exc
++        if value is None:
++            raise ValueError("vLLM prompt logprob entry has a missing logprob")
++        try:
++            parsed = float(value)
++        except (TypeError, ValueError, OverflowError) as exc:
++            raise TypeError(f"vLLM prompt logprob must be numeric, got {type(value).__name__}") from exc
++        # ``-inf`` is a legitimate model log-probability for masked tokens in
++        # an otherwise complete top-k row.  It is not padding: the configured
++        # distillation loss clamp handles it before exponentiation.  NaN and
++        # +inf remain malformed.
++        if math.isnan(parsed) or parsed == float("inf"):
++            raise ValueError(f"vLLM prompt logprob must be finite or -inf, got {value!r}")
++        return parsed
++
++    # NOTE: logprob of the first prompt token is undefined in the causal model.
++    for logprobs_dict in raw_prompt_logprobs[1:]:
++        if logprobs_dict is None:
++            logprobs_dict = {}
++        if not isinstance(logprobs_dict, Mapping):
++            raise TypeError("vLLM prompt logprob rows must be mappings")
++
++        entries: list[tuple[int, int, float]] = []
++        for token_id, token_logprob in logprobs_dict.items():
++            entries.append(
++                (
++                    _parse_rank(getattr(token_logprob, "rank", None)),
++                    _parse_token_id(token_id),
++                    _parse_logprob(token_logprob),
++                )
++            )
+ 
+-    prompt_logprobs_ls, prompt_ids_ls = [], []
+-    # NOTE: logprob of first prompt token is None.
+-    for logprobs_dict in output.prompt_logprobs[1:]:
+         if num_prompt_logprobs == 0:
+-            token_id_str = list(logprobs_dict.keys())[0]
+-            logprob = logprobs_dict[token_id_str].logprob
++            if len(entries) != 1:
++                raise ValueError(
++                    f"vLLM returned {len(entries)} prompt logprob entries with K=0; expected the selected token only"
++                )
++            _, token_id, logprob = entries[0]
++            prompt_ids_ls.append([token_id])
+             prompt_logprobs_ls.append([logprob])
+-            prompt_ids_ls.append([int(token_id_str)])
+         else:
+-            prompt_ids = [None] * num_prompt_logprobs
+-            prompt_logprobs = [None] * num_prompt_logprobs
+-            # We get either top-k logprobs or top-k plus the sampled logprob (if sampled token is not in top-k)
+-            assert len(logprobs_dict) in [num_prompt_logprobs, num_prompt_logprobs + 1], len(logprobs_dict)
+-            for token_id_str, token_logprob in logprobs_dict.items():
+-                rank = token_logprob.rank
+-                if rank > num_prompt_logprobs:
+-                    continue  # the sampled token is not in the top-k
+-                logprob = token_logprob.logprob
+-                prompt_ids[rank - 1] = int(token_id_str)
+-                prompt_logprobs[rank - 1] = logprob
+-            prompt_logprobs_ls.append(prompt_logprobs)
+-            prompt_ids_ls.append(prompt_ids)
+-
+-    # NOTE: pad a dummy prompt logprob for last prompt token.
+-    prompt_logprobs_ls.append([0.0] * max(num_prompt_logprobs, 1))
+-    prompt_ids_ls.append([0] * max(num_prompt_logprobs, 1))
++            topk_entries = [entry for entry in entries if entry[0] <= num_prompt_logprobs]
++            sampled_entries = [entry for entry in entries if entry[0] > num_prompt_logprobs]
++            if len(sampled_entries) > 1:
++                raise ValueError(
++                    f"vLLM returned {len(sampled_entries)} sampled entries outside top-{num_prompt_logprobs}; expected at most 1"
++                )
++            if len(topk_entries) != num_prompt_logprobs:
++                raise ValueError(
++                    f"incomplete vLLM prompt top-k: got {len(topk_entries)} entries, expected {num_prompt_logprobs}"
++                )
++            ranks = [entry[0] for entry in topk_entries]
++            token_ids = [entry[1] for entry in topk_entries]
++            expected_ranks = set(range(1, num_prompt_logprobs + 1))
++            if set(ranks) != expected_ranks or len(set(ranks)) != len(ranks):
++                raise ValueError(
++                    f"incomplete or duplicate vLLM prompt top-k ranks: expected 1..{num_prompt_logprobs}"
++                )
++            if len(set(token_ids)) != len(token_ids):
++                raise ValueError("vLLM prompt top-k contains duplicate token ids")
++            topk_entries.sort(key=lambda entry: entry[0])
++            prompt_ids_ls.append([entry[1] for entry in topk_entries])
++            prompt_logprobs_ls.append([entry[2] for entry in topk_entries])
++
++    # Preserve the historical terminal dummy convention.  It is response-masked.
++    prompt_ids_ls.append([0] * width)
++    prompt_logprobs_ls.append([0.0] * width)
+ 
+     result_dict["prompt_ids"] = prompt_ids_ls
+     result_dict["prompt_logprobs"] = prompt_logprobs_ls
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 6d8773a6cb1ddd5b34ebae587e230c847e4198ba..8d23c194929a7149105acf09aa2e892e95e678a1 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -664,6 +664,7 @@ class vLLMHttpServer:
+             output=final_res,
+             num_prompt_logprobs=sampling_params.prompt_logprobs,
+             result_dict=extra_fields,
++            vocab_size=len(self.model_config.tokenizer),
+         )
+         token_ids = final_res.outputs[0].token_ids
+         log_probs = None
 diff --git a/verl/workers/utils/padding.py b/verl/workers/utils/padding.py
-index ed8d1455..ccc93a70 100644
+index ed8d145520571f60452579a85ffba981dd8d64ec..ccc93a703d03fc6e11b5fcdd58f09264a80742ff 100644
 --- a/verl/workers/utils/padding.py
 +++ b/verl/workers/utils/padding.py
 @@ -20,6 +20,61 @@ from verl.utils import tensordict_utils as tu
  from verl.utils.attention_utils import index_first_axis, unpad_input
-
-
+ 
+ 
 +def pack_position_ids(position_ids: torch.Tensor, total_tokens: int) -> torch.Tensor:
 +    """Pack jagged position IDs without relying on NestedTensor shape metadata.
 +

@@ -25,6 +25,7 @@ def build_command(
     data: Path,
     output: Path,
     chat_template: Path,
+    resume: bool = False,
 ) -> list[str]:
     if int(cfg["world_size"]) != 8:
         raise ReleaseError("the released result is an 8-GPU run; changing world size changes the optimization geometry")
@@ -116,7 +117,7 @@ def build_command(
         "trainer.max_actor_ckpt_to_keep=null",
         "trainer.total_epochs=1",
         f"trainer.total_training_steps={steps}",
-        "trainer.resume_mode=auto",
+        f"trainer.resume_mode={'auto' if resume else 'disable'}",
         "trainer.val_before_train=False",
         f"trainer.default_local_dir={output / 'checkpoints'}",
         f"trainer.rollout_data_dir={output / 'rollouts'}",
@@ -138,10 +139,15 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--teacher", required=True, type=Path)
     value.add_argument("--data", required=True, type=Path)
     value.add_argument("--output", required=True, type=Path)
-    value.add_argument("--verl-root", required=True, type=Path)
+    value.add_argument(
+        "--verl-root",
+        type=Path,
+        help="Deprecated compatibility option; OPD uses Vision-OPD's vendored veRL.",
+    )
     value.add_argument("--vision-opd-root", required=True, type=Path)
     value.add_argument("--python", required=True, type=Path)
     value.add_argument("--chat-template", type=Path)
+    value.add_argument("--resume", action="store_true", help="explicitly resume an existing output")
     value.add_argument("--execute", action="store_true")
     return value
 
@@ -157,11 +163,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_file(args.student / "config.json", "student config")
         require_file(args.teacher / "config.json", "teacher config")
         require_file(args.data, "Vision-OPD parquet")
-        require_dir(args.verl_root, "veRL checkout")
         require_dir(args.vision_opd_root, "Vision-OPD checkout")
+        require_file(
+            args.vision_opd_root / "verl/trainer/config/vopd.yaml",
+            "Vision-OPD vendored veRL vopd config",
+        )
         require_file(template, "Qwen3.5 perception chat template")
         if args.output.is_symlink():
             raise ReleaseError("output cannot be a symlink")
+        if args.output.exists() and not args.resume:
+            raise ReleaseError(f"create-once output already exists: {args.output}")
         command = build_command(
             cfg,
             python=args.python.absolute(),
@@ -170,6 +181,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             data=args.data.absolute(),
             output=args.output.absolute(),
             chat_template=template.absolute(),
+            resume=args.resume,
         )
         plan = {
             "schema_version": "hw_bjtu_opd_crop_launch_v1",
@@ -180,6 +192,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "teacher_fixed": True,
             "world_size": 8,
             "additional_resources_requested": False,
+            "runtime": "Vision-OPD vendored veRL",
+            "runtime_root": str(args.vision_opd_root.absolute()),
             "command": command,
             "shell_command": printable(command),
         }
@@ -188,7 +202,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         args.output.mkdir(parents=True, exist_ok=True)
         write_json(args.output / "launch_plan.json", plan)
-        env = training_env(args.verl_root, args.vision_opd_root)
+        env = training_env(args.vision_opd_root)
         env.update(
             {
                 "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
@@ -197,7 +211,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "VLLM_NO_USAGE_STATS": "1",
             }
         )
-        run(command, cwd=args.verl_root, env=env, log=args.output / "trainer.log")
+        run(command, cwd=args.vision_opd_root, env=env, log=args.output / "trainer.log")
         write_json(args.output / "completion.json", {**plan, "status": "complete"})
         print(json.dumps({"status": "complete", "output": str(args.output)}, sort_keys=True))
         return 0

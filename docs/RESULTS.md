@@ -18,6 +18,15 @@ All rows below use the same V*, MMStar and ZoomBench protocols. The BLINK column
 
 The latest 27B-teacher run is the best macro result in this controlled matrix. Compared with raw Qwen3.5-9B, it changes V*/MMStar/BLINK-v5/ZoomBench by `+8.90/-2.73/+6.89/+12.54` points and macro by `+6.40` points. It does not improve every benchmark: MMStar remains the main regression.
 
+The 9B SFT-teacher row is the publicly released OPD checkpoint. It is second
+by macro, avoids the 27B teacher dependency at evaluation time, and has the
+best MMStar and BLINK-v5 values among the three OPD arms. Its public
+reproduction gate is the complete 191-row VStar cell (`176/191`); the full
+four-benchmark aggregate remains the historical frozen record. A fresh TP4
+run that exactly reproduced this gate is recorded in the sanitized
+[`results/vstar_reproduction_validation.json`](../results/vstar_reproduction_validation.json)
+receipt.
+
 ## Vision-OPD checkpoint results
 
 | Checkpoint | V* | MMStar | BLINK | ZoomBench | Status |
@@ -33,6 +42,13 @@ The local row uses `BLINK-exact/v14`, not `BLINK-v5`, so its BLINK number must n
 - MMStar: `mmstar_qwen35_modelcard_thinking_v2`, 1,500 questions.
 - BLINK-v5: `blink_deterministic_checkpoint_comparison_v5`, 1,901 questions; invalid outputs count as wrong.
 - BLINK-exact: `blink_vlmevalkit_exact_matching_official_comparable_v8_blink_nonthinking`, 1,901 questions.
-- ZoomBench: `zoombench_score_aggregate_v1`, 845 questions with the frozen semantic judge.
+- ZoomBench: `zoombench_score_aggregate_v1`, 845 questions from
+  `inclusionAI/ZoomBench@b788097e57d30510c6877824833234a73bf80d25`
+  (official evaluator `fdc0ba1a3dee916d8c38304d543ad414879e0c99`). The
+  frozen semantic judge is
+  `Qwen/Qwen3.5-27B@fc05daec18b0a78c049392ed2e771dde82bdf654`; only a
+  stripped, case-insensitive exact `yes` is accepted. Exact artifact and
+  source hashes are recorded in
+  [`results/released_opd9_teacher.json`](../results/released_opd9_teacher.json).
 
 Do not merge BLINK-v5 and BLINK-exact into one ranking column. They have different prompt/generation/answer-extraction contracts.

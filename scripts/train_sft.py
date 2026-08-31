@@ -140,7 +140,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_dir(args.verl_root, "veRL checkout")
         require_file(args.dataset_adapter, "SFT dataset adapter")
         observed = sha256_file(args.data)
-        if observed != config["dataset_sha256"]:
+        accepted_hashes = {
+            config["dataset_sha256"],
+            config.get("portable_dataset_sha256", config["dataset_sha256"]),
+        }
+        if observed not in accepted_hashes:
             raise ReleaseError(f"dataset SHA256 differs: {observed}")
         if args.output.exists() or args.output.is_symlink():
             raise ReleaseError(f"create-once output already exists: {args.output}")
@@ -157,6 +161,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "status": "validated",
             "config": config,
             "dataset_sha256": observed,
+            "dataset_variant": "original" if observed == config["dataset_sha256"] else "portable",
             "world_size": 8,
             "additional_resources_requested": False,
             "command": command,

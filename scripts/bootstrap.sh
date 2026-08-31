@@ -6,7 +6,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 third_party="${1:-$repo_root/third_party}"
 python_bin="${PYTHON_BIN:-python3}"
 
-verl_commit=c282ca53a025f00687f53b55b0eb890bf92a9840
+# Public, fetchable upstream base.  The release patch contains both the three
+# historical local commits and the final working-tree changes used by SFT.
+verl_commit=11c94ad2354456d9bfa93c558e05e9430cd731b2
 vision_opd_commit=c8a8fdd1f88eef1b5ef4fe6a8d64eb0272917471
 vlmevalkit_commit=09874c7a69c2a3c7c60ace141525c1552a2c1095
 
@@ -40,6 +42,8 @@ if ! git -C "$third_party/verl" apply --reverse --check "$repo_root/patches/verl
 fi
 cp -R "$repo_root/patches/verl-tests/tests/." "$third_party/verl/tests/"
 
+# The standalone patched checkout is the exact SFT runtime.  OPD uses the
+# vendored veRL in the pinned Vision-OPD checkout, matching the successful run.
 if [[ "${INSTALL_EDITABLE:-1}" == 1 ]]; then
   "$python_bin" -m pip install -e "$third_party/verl" --no-deps
 fi

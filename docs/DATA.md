@@ -46,3 +46,27 @@ python scripts/materialize_sft_dataset.py \
 ```
 
 The released `B54TenKSFTDataset` adapter resolves both original absolute paths and portable relative paths.
+
+## Vision-OPD-6K training data
+
+The released OPD arm uses `yuanqianhao/Vision-OPD-6K` at revision
+`eb5c1c2e7b9a7b6a619efe4161c7369c71bf8af4`. The public preparation command
+verifies the pinned raw files, extracts the three image roles, and writes 6,241
+rows in the original order. Required training fields are:
+
+- `images`: full image with a red target box, used by the student;
+- `bbox_images`: cropped target region, used by the teacher;
+- `original_images`: retained by the source/audit schema.
+
+The historical full denylist audit excluded zero rows. Therefore the public
+`train.parquet` and historical `train_decontaminated.parquet` select identical
+training examples. Their byte SHA256 values are not a portable identity because
+the Parquet rows record the resolved media root. The historical research copy
+was `b8ac1cb2f17d5478af60feab2640d9526e7e816cb1506b5bd521e1598dfeb722`;
+other machines should verify the pinned source revision/checksums, 6,241 rows,
+row order, and view contract rather than require that path-dependent hash.
+
+The optional `validate_vision_opd_6k.py` path performs the complete benchmark
+denylist audit when the official hash-only denylist inputs are available. They
+are not required to recreate the released training rows because the recorded
+exclusion set is empty.

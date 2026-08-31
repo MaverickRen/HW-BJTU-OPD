@@ -4,6 +4,7 @@
   "base_model": "Qwen/Qwen3.5-27B",
   "dataset_rows": 10000,
   "dataset_sha256": "9f56d58c076c255df3bc660ba3c193b1cff8dd69c51ad2f73c844f5f2a8c49b0",
+  "portable_dataset_sha256": "bcc980bf809f6905fa9aab978e59ee8884c45258f6e69c289bf63547aa2dc859",
   "epochs": 1,
   "global_batch_size": 80,
   "micro_batch_size_per_gpu": 1,

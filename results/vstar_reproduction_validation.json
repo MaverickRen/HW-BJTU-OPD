@@ -1,0 +1,67 @@
+{
+  "schema_version": "hw_bjtu_opd_vstar_reproduction_validation_v1",
+  "status": "complete",
+  "validated_on": "2026-08-31",
+  "aggregate_only": true,
+  "sample_level_output": false,
+  "raw_predictions_persisted": false,
+  "artifact": {
+    "repo_id": "HWBJTUOPD/Qwen3.5-9B-SFT10K-VisionOPD6K-SFT9BTeacher",
+    "revision": "6fc7d1ed7c509572898a32ff9de6cff19e8455f0",
+    "model_sha256": "c86054edddaf186b5a0754fed55e4d8e80108ba2081ff7e6ba7c2d3e589ccdc7"
+  },
+  "dataset": {
+    "repo_id": "lmms-lab/vstar-bench",
+    "revision": "b44023b4dca749ed8a76b85eb576627d05a1c174",
+    "rows": 191,
+    "source_parquet_sha256": "6f9a089e93e75931350157544f8e74713d9d108c5f73585609ca262c33528a27",
+    "logical_rows_sha256": "1025f0c463281944034cd79f806aa80d44a82b35453463ab4288429c46f64a2f",
+    "image_manifest_sha256": "0874addfe852aad054879a7020bf3dae880b6ea49ffb7f94eab5b23362444a6c",
+    "evaluation_json_sha256": "96312af877063b80b2a73936e3a2d223d8f3cd6966672759333bdf71e5dd6710"
+  },
+  "protocol": {
+    "name": "vstar_frozen_first_option_v1",
+    "sha256": "55fe9e9013c5a38e20e29446f07106ef9ab482be0f79332676aef9a4bfa07d98",
+    "server_max_model_len": 65536,
+    "temperature": 0,
+    "max_tokens": 32768,
+    "seed": 42,
+    "enable_thinking": false
+  },
+  "hardware": {
+    "nodes": 1,
+    "gpu_model": "NVIDIA L20C",
+    "gpu_count": 4,
+    "tensor_parallel_size": 4
+  },
+  "runtime": {
+    "python": "3.12.3",
+    "cuda": "12.8",
+    "torch": "2.10.0",
+    "transformers": "5.5.0",
+    "tokenizers": "0.22.2",
+    "vllm": "0.18.0",
+    "flashinfer-python": "0.6.6",
+    "quack-kernels": "0.5.0",
+    "nvidia-cutlass-dsl": "4.5.3",
+    "nvidia-cutlass-dsl-libs-base": "4.5.3",
+    "nvidia-nccl-cu12": "2.27.5",
+    "huggingface-hub": "1.21.0"
+  },
+  "result": {
+    "benchmark": "VStar",
+    "correct": 176,
+    "total": 191,
+    "accuracy_percent": 92.14659685863874,
+    "invalid_count": 0
+  },
+  "reference": {
+    "correct": 176,
+    "total": 191,
+    "tolerance_correct": 3
+  },
+  "reproduction": {
+    "correct_delta": 0,
+    "similar": true
+  }
+}
