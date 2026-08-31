@@ -4,6 +4,23 @@ Reproducible Qwen3.5 multimodal SFT and crop-based online perception
 distillation (OPD), with public checkpoints, pinned data, and a simple
 aggregate-only evaluation entry.
 
+[![verify](https://github.com/MaverickRen/HW-BJTU-OPD/actions/workflows/verify.yml/badge.svg)](https://github.com/MaverickRen/HW-BJTU-OPD/actions/workflows/verify.yml)
+
+## Verified release status
+
+Public access and end-to-end reproduction were re-verified on 2026-09-01:
+
+- The final 9B SFT-teacher Vision-OPD checkpoint is public and ungated at
+  revision `6fc7d1ed7c509572898a32ff9de6cff19e8455f0`.
+- The 9B/27B SFT initialization checkpoints and portable SFT_V1 10K data are
+  public and ungated at revision `83362b995e3d3bf6789268e655cb286b925af215`.
+- A clean TP4 run on four NVIDIA L20C GPUs reproduced the released VStar score
+  exactly: **176/191 (92.1466%)**, with zero invalid outputs. The sanitized
+  receipt is
+  [`results/vstar_reproduction_validation.json`](results/vstar_reproduction_validation.json).
+- The GitHub Actions CPU contracts, tests, lint and shell checks pass on the
+  public `main` branch.
+
 ## Public release
 
 The newly released model is the requested **second-highest macro** experiment:
