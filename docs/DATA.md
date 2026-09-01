@@ -58,6 +58,14 @@ rows in the original order. Required training fields are:
 - `bbox_images`: cropped target region, used by the teacher;
 - `original_images`: retained by the source/audit schema.
 
+This is **target-conditioned perception**, not autonomous localization. The
+student must read the content inside a small region from the full image, but
+the red box and the prompt already reveal which region matters. The stored
+`bbox` is not a prediction target, and the released OPD loss contains no bbox
+or region-selection objective. This matches inference with a red-box prompt;
+inference without that prompt would require additional no-box/localization
+training data.
+
 The historical full denylist audit excluded zero rows. Therefore the public
 `train.parquet` and historical `train_decontaminated.parquet` select identical
 training examples. Their byte SHA256 values are not a portable identity because

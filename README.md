@@ -117,6 +117,7 @@ comparison protocol, not an official BLINK leaderboard result. See
 ## Repository layout
 
 ```text
+apps/                    Streamlit inspection tools for real OPD samples
 configs/                 exact SFT, OPD, and artifact contracts
 scripts/                 portable preparation/train/export/evaluation commands
 src/hw_bjtu_opd/         relative-path data adapter and lightweight evaluator
@@ -200,6 +201,26 @@ across machines because the Parquet records resolved media roots. The pinned
 source revision, source checksums, row count, views, and row order are the
 portable identity. See [`docs/DATA.md`](docs/DATA.md) for the optional full
 denylist audit.
+
+## Inspect real Vision-OPD samples
+
+The Streamlit viewer reads either the pinned raw JSONL or the prepared Parquet
+without copying image payloads. It displays the original image, the student's
+red-box full image, the teacher's target crop, the exact question, bbox and
+audit-only gold answer side by side:
+
+```bash
+python -m pip install -e '.[viewer]'
+
+streamlit run apps/opd_data_viewer.py -- \
+  --data data/vision-opd-6k/raw/train.jsonl \
+  --media-root data/vision-opd-6k/media
+```
+
+The same viewer accepts `data/vision-opd-6k/processed/train.parquet`. The
+`--media-root` override makes copied Parquet snapshots portable by remapping
+their recorded `relative_*` media fields. Images are loaded lazily, so browsing
+does not place the roughly 37 GB compressed source archive in memory.
 
 ## Reproduce the released OPD training arm
 

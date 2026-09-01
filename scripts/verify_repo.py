@@ -17,7 +17,7 @@ SECRET_PATTERNS = {
     "hf_token": re.compile(r"hf_[A-Za-z0-9]{20,}"),
     "private_key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 }
-PUBLIC_PREFIXES = ("README.md", "docs/", "configs/", "scripts/", "src/", "results/", "hf_card/")
+PUBLIC_PREFIXES = ("README.md", "apps/", "docs/", "configs/", "scripts/", "src/", "results/", "hf_card/")
 INTERNAL_PATHS = ("/minimax-3d-rw-backup/users/", "/home/jiazhi/", "/root/")
 PATH_SCANNER_IMPLEMENTATIONS = {"scripts/verify_repo.py", "scripts/materialize_sft_dataset.py"}
 

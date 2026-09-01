@@ -18,14 +18,20 @@ jobs:
       - run: pytest
       - run: >-
           ruff check
+          apps/opd_data_viewer.py
           scripts/evaluate.py scripts/preflight.py scripts/prepare_vstar.py
           scripts/prepare_opd_release.py src/hw_bjtu_opd/eval
-          tests/test_eval_cli.py tests/test_opd_release.py tests/test_results.py
+          src/hw_bjtu_opd/data/opd_samples.py
+          tests/test_eval_cli.py tests/test_opd_release.py tests/test_opd_samples.py
+          tests/test_results.py
       - run: >-
           ruff format --check
+          apps/opd_data_viewer.py
           scripts/evaluate.py scripts/preflight.py scripts/prepare_vstar.py
           scripts/prepare_opd_release.py src/hw_bjtu_opd/eval
-          tests/test_eval_cli.py tests/test_opd_release.py tests/test_results.py
+          src/hw_bjtu_opd/data/opd_samples.py
+          tests/test_eval_cli.py tests/test_opd_release.py tests/test_opd_samples.py
+          tests/test_results.py
       - run: >-
           bash -n scripts/install_eval.sh scripts/evaluate_vstar.sh
           scripts/bootstrap.sh scripts/export_opd_checkpoint.sh
